@@ -33,6 +33,9 @@
     "react-dom": "^18.3.1",
     "winston": "^3.11.0",
     "ws": "^8.14.2",
+    "y-protocols": "^1.0.7",
+    "y-websocket": "^3.0.0",
+    "yjs": "^13.6.30",
     "zod": "^3.22.4",
     "zod-to-json-schema": "^3.22.3"
   },
