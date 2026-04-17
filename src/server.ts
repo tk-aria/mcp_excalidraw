@@ -7,7 +7,7 @@ import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import logger from './utils/logger.js';
 import {
-  elements,
+  elements as _legacyElements,
   files,
   snapshots,
   generateId,
@@ -25,6 +25,7 @@ import {
   Snapshot,
   normalizeFontFamily
 } from './types.js';
+import { YjsElementsMap, setupYjsWebSocket } from './yjs-sync.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
 
@@ -36,7 +37,10 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+const wss = new WebSocketServer({ noServer: true });
+
+// Yjs-backed elements storage (drop-in replacement for Map<string, ServerElement>)
+const elements = new YjsElementsMap();
 
 // Middleware
 app.use(cors());
@@ -731,58 +735,85 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
       });
     }
 
-    // Record element count before sync
     const beforeCount = elements.size;
+    const now = new Date().toISOString();
 
-    // 1. Clear existing memory storage
-    elements.clear();
-    logger.info(`Cleared existing elements: ${beforeCount} elements removed`);
+    // Build a set of incoming element IDs for tracking
+    const incomingIds = new Set<string>();
 
-    // 2. Batch write new data
-    let successCount = 0;
-    const processedElements: ServerElement[] = [];
-
+    // Merge incoming elements (add new, update existing by version/timestamp)
+    let mergedCount = 0;
     frontendElements.forEach((element: any, index: number) => {
       try {
-        // Ensure element has ID, generate one if missing
         const elementId = element.id || generateId();
+        incomingIds.add(elementId);
 
-        // Add server metadata
-        const processedElement: ServerElement = {
-          ...element,
-          id: elementId,
-          syncedAt: new Date().toISOString(),
-          source: 'frontend_sync',
-          syncTimestamp: timestamp,
-          version: 1
-        };
+        // Handle explicit deletions
+        if (element.isDeleted) {
+          elements.delete(elementId);
+          mergedCount++;
+          return;
+        }
 
-        // Store to memory
-        elements.set(elementId, processedElement);
-        processedElements.push(processedElement);
-        successCount++;
+        const existing = elements.get(elementId);
 
+        // Determine if incoming element is newer (Last Write Wins)
+        let shouldUpdate = true;
+        if (existing) {
+          const existingUpdated = existing.updatedAt || existing.syncedAt || '';
+          const incomingUpdated = element.updated
+            ? new Date(element.updated).toISOString()
+            : timestamp || now;
+          // Keep existing if it was updated more recently by another source
+          if (existing.source !== 'frontend_sync' && existingUpdated > incomingUpdated) {
+            shouldUpdate = false;
+          }
+        }
+
+        if (shouldUpdate) {
+          const processedElement: ServerElement = {
+            ...element,
+            id: elementId,
+            syncedAt: now,
+            source: 'frontend_sync',
+            syncTimestamp: timestamp,
+            version: (existing?.version || 0) + 1
+          };
+          elements.set(elementId, processedElement);
+        }
+        mergedCount++;
       } catch (elementError) {
         logger.warn(`Failed to process element ${index}:`, elementError);
       }
     });
 
-    logger.info(`Sync completed: ${successCount}/${frontendElements.length} elements synced`);
+    // Remove server elements that the client no longer has
+    // (client deleted them via eraser or selection delete)
+    for (const [id, el] of elements) {
+      if (!incomingIds.has(id) && el.source === 'frontend_sync') {
+        elements.delete(id);
+      }
+    }
 
-    // 3. Broadcast sync event to all WebSocket clients
+    logger.info(`Sync merged: ${mergedCount} from client, ${elements.size} total (was ${beforeCount})`);
+
+    // Collect all active elements after merge for broadcast
+    const allElements = Array.from(elements.values());
+
+    // Broadcast merged state to all WebSocket clients
     broadcast({
       type: 'elements_synced',
-      count: successCount,
-      timestamp: new Date().toISOString(),
+      count: allElements.length,
+      elements: allElements,
+      timestamp: now,
       source: 'manual_sync'
     });
 
-    // 4. Return sync results
     res.json({
       success: true,
-      message: `Successfully synced ${successCount} elements`,
-      count: successCount,
-      syncedAt: new Date().toISOString(),
+      message: `Successfully merged ${mergedCount} elements`,
+      count: elements.size,
+      syncedAt: now,
       beforeCount,
       afterCount: elements.size
     });
@@ -1199,9 +1230,28 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || 'localhost';
 
+// Set up Yjs WebSocket server on /yjs path
+const yjsWss = setupYjsWebSocket(server);
+
+// Route WebSocket upgrades by path
+server.on('upgrade', (request, socket, head) => {
+  const pathname = new URL(request.url || '', `http://${request.headers.host}`).pathname;
+
+  if (pathname.startsWith('/yjs')) {
+    yjsWss.handleUpgrade(request, socket, head, (ws) => {
+      yjsWss.emit('connection', ws, request);
+    });
+  } else {
+    wss.handleUpgrade(request, socket, head, (ws) => {
+      wss.emit('connection', ws, request);
+    });
+  }
+});
+
 server.listen(PORT, HOST, () => {
   logger.info(`POC server running on http://${HOST}:${PORT}`);
   logger.info(`WebSocket server running on ws://${HOST}:${PORT}`);
+  logger.info(`Yjs WebSocket server running on ws://${HOST}:${PORT}/yjs`);
 });
 
 export default app;
