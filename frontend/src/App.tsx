@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useEffect, useRef, useCallback } from 'react'
 import {
   Excalidraw,
   convertToExcalidrawElements,
@@ -10,6 +10,8 @@ import {
 import type { ExcalidrawElement, NonDeleted, NonDeletedExcalidrawElement } from '@excalidraw/excalidraw/types/element/types'
 import { convertMermaidToExcalidraw, DEFAULT_MERMAID_CONFIG } from './utils/mermaidConverter'
 import type { MermaidConfig } from '@excalidraw/mermaid-to-excalidraw'
+import * as Y from 'yjs'
+import { WebsocketProvider } from 'y-websocket'
 
 // Type definitions
 type ExcalidrawAPIRefValue = ExcalidrawImperativeAPI;
@@ -280,6 +282,13 @@ function App(): JSX.Element {
   const autoSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const syncInFlightRef = useRef<boolean>(false)
   const suppressAutoSyncCountRef = useRef<number>(0)
+
+  // ── Yjs state ────────────────────────────────────────────────
+  const ydocRef = useRef<Y.Doc | null>(null)
+  const yjsProviderRef = useRef<WebsocketProvider | null>(null)
+  const yElementsRef = useRef<Y.Map<any> | null>(null)
+  const suppressYjsSyncRef = useRef<boolean>(false) // prevent infinite loop
+  const prevElementNoncesRef = useRef<Map<string, number>>(new Map()) // id → versionNonce for change detection
   const userInteractedRef = useRef<boolean>(false)
 
   const applySceneUpdateWithoutAutoSync = (
@@ -301,7 +310,111 @@ function App(): JSX.Element {
     }
   }, [])
 
-  // WebSocket connection
+  // ── Yjs initialization ──────────────────────────────────────
+  useEffect(() => {
+    const doc = new Y.Doc()
+    ydocRef.current = doc
+    const yElements = doc.getMap('elements')
+    yElementsRef.current = yElements
+
+    const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
+    const yjsUrl = `${wsProtocol}//${window.location.host}/yjs`
+    const provider = new WebsocketProvider(yjsUrl, 'excalidraw-room', doc)
+    yjsProviderRef.current = provider
+
+    provider.on('status', (event: { status: string }) => {
+      console.log('Yjs connection status:', event.status)
+    })
+
+    // Observe Y.Map changes → apply to Excalidraw canvas
+    yElements.observe((event: Y.YMapEvent<any>) => {
+      if (event.transaction.origin === 'local') return // skip our own changes
+
+      const api = excalidrawAPIRef.current
+      if (!api) return
+
+      suppressYjsSyncRef.current = true
+
+      const currentElements = api.getSceneElements()
+      const currentMap = new Map(currentElements.map(el => [el.id, el]))
+
+      // Apply additions and updates
+      event.changes.keys.forEach((change, key) => {
+        if (change.action === 'add' || change.action === 'update') {
+          const serverEl = yElements.get(key)
+          if (serverEl) {
+            const cleaned = cleanElementForExcalidraw(serverEl)
+            currentMap.set(key, cleaned as any)
+          }
+        } else if (change.action === 'delete') {
+          currentMap.delete(key)
+        }
+      })
+
+      const merged = Array.from(currentMap.values())
+      const converted = convertElementsPreservingImageProps(merged as any)
+      applySceneUpdateWithoutAutoSync(api, {
+        elements: converted,
+        captureUpdate: CaptureUpdateAction.NEVER
+      })
+
+      // Update prev tracking with current nonces
+      const newPrev = new Map<string, number>()
+      api.getSceneElements().forEach(el => {
+        newPrev.set(el.id, el.versionNonce)
+      })
+      prevElementNoncesRef.current = newPrev
+
+      setTimeout(() => {
+        suppressYjsSyncRef.current = false
+      }, 0)
+    })
+
+    return () => {
+      provider.disconnect()
+      provider.destroy()
+      doc.destroy()
+    }
+  }, [])
+
+  // ── Yjs onChange handler: push local changes to Y.Map ────────
+  const handleYjsSync = useCallback(() => {
+    if (suppressYjsSyncRef.current) return
+    const api = excalidrawAPIRef.current
+    const yElements = yElementsRef.current
+    const doc = ydocRef.current
+    if (!api || !yElements || !doc) return
+
+    const currentElements = api.getSceneElements()
+    const currentNonces = new Map<string, number>()
+    const prev = prevElementNoncesRef.current
+    let hasChanges = false
+
+    doc.transact(() => {
+      // Only write elements whose versionNonce changed
+      // versionNonce is regenerated on EVERY element modification in Excalidraw
+      currentElements.forEach(el => {
+        currentNonces.set(el.id, el.versionNonce)
+        const prevNonce = prev.get(el.id)
+        if (prevNonce === undefined || prevNonce !== el.versionNonce) {
+          yElements.set(el.id, { ...el })
+          hasChanges = true
+        }
+      })
+
+      // Delete elements that are no longer in the scene (eraser, delete key)
+      prev.forEach((_, id) => {
+        if (!currentNonces.has(id) && yElements.has(id)) {
+          yElements.delete(id)
+          hasChanges = true
+        }
+      })
+    }, 'local')
+
+    prevElementNoncesRef.current = currentNonces
+  }, [])
+
+  // WebSocket connection (legacy - for MCP notifications like viewport, export, mermaid)
   useEffect(() => {
     connectWebSocket()
     return () => {
@@ -311,12 +424,9 @@ function App(): JSX.Element {
     }
   }, [])
 
-  // Load existing elements when Excalidraw API becomes available
+  // Ensure legacy WebSocket is connected (for viewport/export/mermaid notifications)
   useEffect(() => {
     if (excalidrawAPI) {
-      loadExistingElements()
-
-      // Ensure WebSocket is connected for real-time updates
       if (!isConnected) {
         connectWebSocket()
       }
@@ -363,10 +473,7 @@ function App(): JSX.Element {
 
     websocketRef.current.onopen = () => {
       setIsConnected(true)
-
-      if (excalidrawAPI) {
-        setTimeout(loadExistingElements, 100)
-      }
+      // Element loading is handled by Yjs sync — no need to fetch via HTTP
     }
 
     websocketRef.current.onmessage = (event: MessageEvent) => {
@@ -428,63 +535,21 @@ function App(): JSX.Element {
       }
 
       switch (data.type) {
+        // ── Element sync is now handled by Yjs — skip legacy merge handlers ──
         case 'initial_elements':
-          if (data.elements && data.elements.length > 0) {
-            const cleanedElements = data.elements.map(cleanElementForExcalidraw)
-            const convertedElements = convertElementsPreservingImageProps(cleanedElements)
-            applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-              elements: convertedElements,
-              captureUpdate: CaptureUpdateAction.NEVER
-            })
-          }
-          // Load files for image elements
-          if ((data as any).files) {
-            excalidrawAPI.addFiles(Object.values((data as any).files))
-          }
+        case 'element_created':
+        case 'element_updated':
+        case 'element_deleted':
+        case 'elements_batch_created':
+        case 'elements_synced':
+          // No-op: Yjs Y.Map handles element synchronization
+          console.log(`[legacy WS] Ignoring element sync message: ${data.type}`)
           break
 
         case 'files_added':
           if (Array.isArray((data as any).files)) {
             excalidrawAPI.addFiles((data as any).files)
           }
-          break
-
-        case 'element_created':
-          if (data.element) {
-            const cleanedNewElement = cleanElementForExcalidraw(data.element)
-            // Rebuild against full scene so text/container bindings remain intact.
-            mergeAndApplySceneElements([cleanedNewElement])
-          }
-          break
-
-        case 'element_updated':
-          if (data.element) {
-            const cleanedUpdatedElement = cleanElementForExcalidraw(data.element)
-            // Convert with full scene context so text metrics/container placement can refresh.
-            mergeAndApplySceneElements([cleanedUpdatedElement])
-          }
-          break
-
-        case 'element_deleted':
-          if (data.elementId) {
-            const filteredElements = currentElements.filter(el => el.id !== data.elementId)
-            applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-              elements: filteredElements,
-              captureUpdate: CaptureUpdateAction.NEVER
-            })
-          }
-          break
-
-        case 'elements_batch_created':
-          if (data.elements) {
-            const cleanedBatchElements = data.elements.map(cleanElementForExcalidraw)
-            mergeAndApplySceneElements(cleanedBatchElements)
-          }
-          break
-
-        case 'elements_synced':
-          console.log(`Sync confirmed by server: ${data.count} elements`)
-          // Sync confirmation already handled by HTTP response
           break
 
         case 'sync_status':
@@ -730,15 +795,12 @@ function App(): JSX.Element {
     }
 
     try {
-      // 1. Get current elements
+      // 1. Get current elements (include isDeleted so server can propagate deletions)
       const currentElements = excalidrawAPI.getSceneElements()
       console.log(`Syncing ${currentElements.length} elements to backend`)
 
-      // Filter out deleted elements
-      const activeElements = currentElements.filter(el => !el.isDeleted)
-
-      // 3. Convert to backend format
-      const backendElements = activeElements.map(convertToBackendFormat)
+      // Convert to backend format (keep isDeleted elements for deletion propagation)
+      const backendElements = currentElements.map(convertToBackendFormat)
 
       // 4. Send to backend
       const response = await fetch('/api/elements/sync', {
@@ -888,7 +950,7 @@ function App(): JSX.Element {
           <Excalidraw
             excalidrawAPI={(api: ExcalidrawAPIRefValue) => setExcalidrawAPI(api)}
             onChange={() => {
-              scheduleAutoSync()
+              handleYjsSync()
             }}
             initialData={{
               elements: [],
