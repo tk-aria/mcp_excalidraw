@@ -272,6 +272,33 @@ function App(): JSX.Element {
   const excalidrawAPIRef = useRef<ExcalidrawAPIRefValue | null>(null)
   useEffect(() => {
     excalidrawAPIRef.current = excalidrawAPI
+
+    // When excalidrawAPI becomes available, apply any Yjs elements that arrived
+    // before the API was ready (initial sync race condition fix)
+    if (excalidrawAPI && yElementsRef.current) {
+      const yElements = yElementsRef.current
+      if (yElements.size > 0) {
+        console.log(`[Yjs] API ready — applying ${yElements.size} existing elements`)
+        suppressYjsSyncRef.current = true
+        const currentMap = new Map<string, any>()
+        yElements.forEach((val: any, key: string) => {
+          currentMap.set(key, cleanElementForExcalidraw(val))
+        })
+        const merged = Array.from(currentMap.values())
+        const converted = convertElementsPreservingImageProps(merged as any)
+        applySceneUpdateWithoutAutoSync(excalidrawAPI, {
+          elements: converted,
+          captureUpdate: CaptureUpdateAction.NEVER
+        })
+        // Update nonce tracking
+        const newPrev = new Map<string, number>()
+        excalidrawAPI.getSceneElements().forEach((el: any) => {
+          newPrev.set(el.id, el.versionNonce)
+        })
+        prevElementNoncesRef.current = newPrev
+        setTimeout(() => { suppressYjsSyncRef.current = false }, 0)
+      }
+    }
   }, [excalidrawAPI])
   const [isConnected, setIsConnected] = useState<boolean>(false)
   const websocketRef = useRef<WebSocket | null>(null)
