@@ -50,8 +50,8 @@ WORKDIR /app
 # Copy package files
 COPY package*.json ./
 
-# Install only production dependencies
-RUN npm ci --only=production && npm cache clean --force
+# Install production dependencies + supergateway for MCP HTTP bridge
+RUN npm ci --only=production && npm install supergateway && npm cache clean --force
 
 # Copy compiled backend from builder stage
 COPY --from=backend-builder /app/dist ./dist
@@ -59,8 +59,11 @@ COPY --from=backend-builder /app/dist ./dist
 # Copy built frontend from frontend-builder stage
 COPY --from=frontend-builder /app/dist/frontend ./dist/frontend
 
+# Copy entrypoint
+COPY entrypoint.sh /app/entrypoint.sh
+
 # Set ownership to nodejs user
-RUN chown -R nodejs:nodejs /app
+RUN chmod +x /app/entrypoint.sh && chown -R nodejs:nodejs /app
 
 # Switch to non-root user
 USER nodejs
@@ -69,14 +72,15 @@ USER nodejs
 ENV NODE_ENV=production
 ENV PORT=3000
 ENV HOST=0.0.0.0
+ENV MCP_PORT=3001
 
-# Expose port
-EXPOSE 3000
+# Expose ports (canvas + MCP bridge)
+EXPOSE 3000 3001
 
-# Run canvas server (web UI + REST API)
-CMD ["node", "dist/server.js"]
+# Run canvas server + MCP HTTP bridge
+CMD ["/app/entrypoint.sh"]
 
 # Labels for metadata
-LABEL org.opencontainers.image.source="https://github.com/yctimlin/mcp_excalidraw"
-LABEL org.opencontainers.image.description="MCP Excalidraw Canvas Server - Web UI and REST API"
+LABEL org.opencontainers.image.source="https://github.com/tk-aria/mcp_excalidraw"
+LABEL org.opencontainers.image.description="MCP Excalidraw Canvas + MCP HTTP Bridge"
 LABEL org.opencontainers.image.licenses="MIT"
