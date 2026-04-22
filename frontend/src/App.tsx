@@ -316,6 +316,7 @@ function App(): JSX.Element {
   const yElementsRef = useRef<Y.Map<any> | null>(null)
   const suppressYjsSyncRef = useRef<boolean>(false) // prevent infinite loop
   const prevElementNoncesRef = useRef<Map<string, number>>(new Map()) // id → versionNonce for change detection
+  const prevFileIdsRef = useRef<Set<string>>(new Set()) // track uploaded file IDs
   const userInteractedRef = useRef<boolean>(false)
 
   const applySceneUpdateWithoutAutoSync = (
@@ -337,7 +338,7 @@ function App(): JSX.Element {
     }
   }, [])
 
-  // ── Yjs initialization ──────────────────────────────────────
+  // ── Yjs initialization with fallback URLs ───────────────────
   useEffect(() => {
     const doc = new Y.Doc()
     ydocRef.current = doc
@@ -345,13 +346,62 @@ function App(): JSX.Element {
     yElementsRef.current = yElements
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const yjsUrl = `${wsProtocol}//${window.location.host}/yjs`
-    const provider = new WebsocketProvider(yjsUrl, 'excalidraw-room', doc)
-    yjsProviderRef.current = provider
 
-    provider.on('status', (event: { status: string }) => {
-      console.log('Yjs connection status:', event.status)
-    })
+    // Build candidate URLs in priority order:
+    // 1. VITE_YJS_WS_URL env var (explicit override)
+    // 2. window.location.host (same host:port — works when canvas serves directly)
+    // 3. window.location.hostname (port 80/443 — works behind non-WS proxy)
+    const envUrl = (import.meta as any).env?.VITE_YJS_WS_URL as string | undefined
+    const hostUrl = `${wsProtocol}//${window.location.host}/yjs`
+    const hostnameUrl = `${wsProtocol}//${window.location.hostname}/yjs`
+    const candidateUrls = envUrl ? [envUrl] : [hostUrl, hostnameUrl]
+    // Deduplicate (host === hostname when using default port)
+    const urls = [...new Set(candidateUrls)]
+
+    let currentUrlIndex = 0
+    const FALLBACK_TIMEOUT_MS = 3000
+
+    const connectProvider = (url: string): WebsocketProvider => {
+      console.log(`[Yjs] Trying: ${url}`)
+      return new WebsocketProvider(url, 'excalidraw-room', doc)
+    }
+
+    let provider = connectProvider(urls[0])
+    yjsProviderRef.current = provider
+    let fallbackTimer: ReturnType<typeof setTimeout> | null = null
+
+    const tryNextUrl = () => {
+      currentUrlIndex++
+      if (currentUrlIndex < urls.length) {
+        console.log(`[Yjs] Falling back to: ${urls[currentUrlIndex]}`)
+        provider.disconnect()
+        provider.destroy()
+        provider = connectProvider(urls[currentUrlIndex])
+        yjsProviderRef.current = provider
+        setupProviderListeners()
+        // Set another fallback timer for the next candidate
+        if (currentUrlIndex + 1 < urls.length) {
+          fallbackTimer = setTimeout(tryNextUrl, FALLBACK_TIMEOUT_MS)
+        }
+      }
+    }
+
+    const setupProviderListeners = () => {
+      provider.on('status', (event: { status: string }) => {
+        console.log(`[Yjs] ${urls[currentUrlIndex]} status: ${event.status}`)
+        if (event.status === 'connected' && fallbackTimer) {
+          clearTimeout(fallbackTimer)
+          fallbackTimer = null
+          console.log(`[Yjs] Connected successfully to: ${urls[currentUrlIndex]}`)
+        }
+      })
+    }
+
+    setupProviderListeners()
+    // Start fallback timer if we have more candidates
+    if (urls.length > 1) {
+      fallbackTimer = setTimeout(tryNextUrl, FALLBACK_TIMEOUT_MS)
+    }
 
     // Observe Y.Map changes → apply to Excalidraw canvas
     yElements.observe((event: Y.YMapEvent<any>) => {
@@ -398,6 +448,7 @@ function App(): JSX.Element {
     })
 
     return () => {
+      if (fallbackTimer) clearTimeout(fallbackTimer)
       provider.disconnect()
       provider.destroy()
       doc.destroy()
@@ -439,6 +490,26 @@ function App(): JSX.Element {
     }, 'local')
 
     prevElementNoncesRef.current = currentNonces
+
+    // Sync new files (images) to server via REST API
+    // Excalidraw stores image binary data separately from elements
+    if (hasChanges) {
+      const files = api.getFiles()
+      const fileIds = Object.keys(files)
+      if (fileIds.length > 0) {
+        const prev = prevFileIdsRef.current
+        const newFiles = fileIds.filter(id => !prev.has(id))
+        if (newFiles.length > 0) {
+          const filesToUpload = newFiles.map(id => files[id])
+          fetch('/api/files', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ files: filesToUpload })
+          }).catch(err => console.error('[Yjs] Failed to upload files:', err))
+          newFiles.forEach(id => prev.add(id))
+        }
+      }
+    }
   }, [])
 
   // WebSocket connection (legacy - for MCP notifications like viewport, export, mermaid)
@@ -488,14 +559,21 @@ function App(): JSX.Element {
     }
   }
 
-  const connectWebSocket = (): void => {
+  const connectWebSocket = (urlIndex = 0): void => {
     if (websocketRef.current && websocketRef.current.readyState === WebSocket.OPEN) {
       return
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-    const wsUrl = `${protocol}//${window.location.host}`
+    const candidates = [
+      `${protocol}//${window.location.host}`,
+      `${protocol}//${window.location.hostname}`,
+    ]
+    const urls = [...new Set(candidates)]
+    if (urlIndex >= urls.length) return
 
+    const wsUrl = urls[urlIndex]
+    console.log(`[WS] Trying: ${wsUrl}`)
     websocketRef.current = new WebSocket(wsUrl)
 
     websocketRef.current.onopen = () => {
@@ -522,8 +600,15 @@ function App(): JSX.Element {
     }
 
     websocketRef.current.onerror = (error: Event) => {
-      console.error('WebSocket error:', error)
+      console.error(`[WS] Error on ${wsUrl}:`, error)
       setIsConnected(false)
+      // Try next URL candidate
+      if (urlIndex + 1 < urls.length) {
+        console.log(`[WS] Falling back to next candidate...`)
+        websocketRef.current?.close()
+        websocketRef.current = null
+        connectWebSocket(urlIndex + 1)
+      }
     }
   }
 
