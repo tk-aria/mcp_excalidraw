@@ -83,7 +83,7 @@ type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
 const AUTO_SYNC_DEBOUNCE_MS = 1200;
 
 // Helper function to clean elements for Excalidraw
-const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawElement> => {
+const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawElement> & { _zIndex?: number } => {
   const {
     createdAt,
     updatedAt,
@@ -94,6 +94,11 @@ const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawEl
     ...cleanElement
   } = element;
   return cleanElement;
+}
+
+const stripZIndex = (el: any): any => {
+  const { _zIndex, ...rest } = el;
+  return rest;
 }
 
 // Helper function to validate and fix element binding data
@@ -257,19 +262,118 @@ const convertElementsPreservingImageProps = (
   if (elements.length === 0) return []
 
   const validatedElements = validateAndFixBindings(elements)
-  const imageElements = validatedElements.filter(isImageElement).map(normalizeImageElement)
-  const nonImageElements = validatedElements.filter(el => !isImageElement(el))
-  // convertToExcalidrawElements may expand labeled shapes into [shape, textElement],
-  // so we cannot assume a 1:1 mapping — return all converted elements directly.
+
+  // Separate images vs non-images, but remember original positions
+  const nonImageElements: Partial<ExcalidrawElement>[] = []
+  const originalIndices: number[] = [] // original index for each non-image element
+  validatedElements.forEach((el, idx) => {
+    if (!isImageElement(el)) {
+      nonImageElements.push(el)
+      originalIndices.push(idx)
+    }
+  })
+
   const convertedNonImageElements = convertToExcalidrawElements(nonImageElements as any, { regenerateIds: false })
   const restoredNonImageElements = restoreBindings(convertedNonImageElements, nonImageElements)
-  return recenterBoundShapeTextElements([...restoredNonImageElements, ...imageElements])
+
+  // Rebuild array preserving original order: place converted non-images and
+  // normalized images back at their original positions
+  const result: Partial<ExcalidrawElement>[] = [...validatedElements]
+  // Replace image elements in-place with normalized versions
+  result.forEach((el, idx) => {
+    if (isImageElement(el)) {
+      result[idx] = normalizeImageElement(el)
+    }
+  })
+  // Replace non-image elements with their converted versions.
+  // convertToExcalidrawElements may expand labeled shapes (1 input → 2 outputs),
+  // so we collect extras and append them right after the original position.
+  const extras: Array<{ afterIdx: number; els: Partial<ExcalidrawElement>[] }> = []
+  let convertedOffset = 0
+  for (let i = 0; i < nonImageElements.length; i++) {
+    const origIdx = originalIndices[i]
+    const origId = nonImageElements[i].id
+    // Find matching converted elements (may be 1 or more due to label expansion)
+    const matched: Partial<ExcalidrawElement>[] = []
+    while (convertedOffset < restoredNonImageElements.length) {
+      const cel = restoredNonImageElements[convertedOffset]
+      matched.push(cel)
+      convertedOffset++
+      if ((cel as any).id === origId) break
+      // If it's a text element with containerId matching origId, it's a label expansion
+      if ((cel as any).containerId === origId) continue
+      break
+    }
+    // Also grab any trailing label text elements
+    while (convertedOffset < restoredNonImageElements.length) {
+      const cel = restoredNonImageElements[convertedOffset]
+      if ((cel as any).containerId === origId) {
+        matched.push(cel)
+        convertedOffset++
+      } else {
+        break
+      }
+    }
+    if (matched.length === 1) {
+      result[origIdx] = matched[0]
+    } else if (matched.length > 1) {
+      result[origIdx] = matched[0]
+      extras.push({ afterIdx: origIdx, els: matched.slice(1) })
+    }
+  }
+  // Insert extras (expanded label text elements) in reverse order to preserve indices
+  extras.sort((a, b) => b.afterIdx - a.afterIdx)
+  for (const { afterIdx, els } of extras) {
+    result.splice(afterIdx + 1, 0, ...els)
+  }
+
+  return recenterBoundShapeTextElements(result)
 }
 
 function App(): JSX.Element {
   const [excalidrawAPI, setExcalidrawAPI] = useState<ExcalidrawAPIRefValue | null>(null)
   // Ref so WS message handlers (captured in stale closures) always see the latest API instance
   const excalidrawAPIRef = useRef<ExcalidrawAPIRefValue | null>(null)
+  // Helper: apply all current yElements to the Excalidraw canvas, sorted by _zIndex.
+  // Falls back to Yjs insertion order for elements without _zIndex.
+  const applyYjsElementsToCanvas = useCallback((api: ExcalidrawImperativeAPI, label: string): void => {
+    const yElements = yElementsRef.current
+    if (!yElements || yElements.size === 0) return
+
+    console.log(`[Yjs] ${label} — applying ${yElements.size} element(s)`)
+    suppressYjsSyncRef.current = true
+
+    // Build ordered list: _zIndex when present, insertion order as fallback
+    const orderedEntries: Array<{ key: string; zIndex: number; cleaned: any }> = []
+    let insertionIdx = 0
+    yElements.forEach((val: any, key: string) => {
+      const cleaned = cleanElementForExcalidraw(val)
+      const zIndex = typeof (cleaned as any)._zIndex === 'number'
+        ? (cleaned as any)._zIndex
+        : insertionIdx
+      orderedEntries.push({ key, zIndex, cleaned })
+      insertionIdx++
+    })
+    orderedEntries.sort((a, b) => a.zIndex - b.zIndex)
+
+    const merged = orderedEntries.map(e => stripZIndex(e.cleaned))
+    const converted = convertElementsPreservingImageProps(merged as any)
+    applySceneUpdateWithoutAutoSync(api, {
+      elements: converted,
+      captureUpdate: CaptureUpdateAction.NEVER
+    })
+
+    const newPrev = new Map<string, number>()
+    const newOrder = new Map<string, number>()
+    api.getSceneElements().forEach((el: any, idx: number) => {
+      newPrev.set(el.id, el.versionNonce)
+      newOrder.set(el.id, idx)
+    })
+    prevElementNoncesRef.current = newPrev
+    prevElementOrderRef.current = newOrder
+    setTimeout(() => { suppressYjsSyncRef.current = false }, 100)
+  }, [])
+
   useEffect(() => {
     excalidrawAPIRef.current = excalidrawAPI
 
@@ -288,30 +392,9 @@ function App(): JSX.Element {
         excalidrawAPI.addFiles(existingFiles)
       }
 
-      const yElements = yElementsRef.current
-      if (yElements.size > 0) {
-        console.log(`[Yjs] API ready — applying ${yElements.size} existing elements`)
-        suppressYjsSyncRef.current = true
-        const currentMap = new Map<string, any>()
-        yElements.forEach((val: any, key: string) => {
-          currentMap.set(key, cleanElementForExcalidraw(val))
-        })
-        const merged = Array.from(currentMap.values())
-        const converted = convertElementsPreservingImageProps(merged as any)
-        applySceneUpdateWithoutAutoSync(excalidrawAPI, {
-          elements: converted,
-          captureUpdate: CaptureUpdateAction.NEVER
-        })
-        // Update nonce tracking
-        const newPrev = new Map<string, number>()
-        excalidrawAPI.getSceneElements().forEach((el: any) => {
-          newPrev.set(el.id, el.versionNonce)
-        })
-        prevElementNoncesRef.current = newPrev
-        setTimeout(() => { suppressYjsSyncRef.current = false }, 0)
-      }
+      applyYjsElementsToCanvas(excalidrawAPI, 'API ready')
     }
-  }, [excalidrawAPI])
+  }, [excalidrawAPI, applyYjsElementsToCanvas])
   const [isConnected, setIsConnected] = useState<boolean>(false)
   const websocketRef = useRef<WebSocket | null>(null)
 
@@ -328,7 +411,9 @@ function App(): JSX.Element {
   const yElementsRef = useRef<Y.Map<any> | null>(null)
   const yFilesRef = useRef<Y.Map<any> | null>(null)
   const suppressYjsSyncRef = useRef<boolean>(false) // prevent infinite loop
+  const initialSyncDoneRef = useRef<boolean>(false) // block local→server push until first sync completes
   const prevElementNoncesRef = useRef<Map<string, number>>(new Map()) // id → versionNonce for change detection
+  const prevElementOrderRef = useRef<Map<string, number>>(new Map()) // id → array index for layer order tracking
   const prevFileIdsRef = useRef<Set<string>>(new Set()) // track uploaded file IDs
   const userInteractedRef = useRef<boolean>(false)
 
@@ -428,38 +513,65 @@ function App(): JSX.Element {
       suppressYjsSyncRef.current = true
 
       const currentElements = api.getSceneElements()
-      const currentMap = new Map(currentElements.map(el => [el.id, el]))
+      const currentMap = new Map<string, any>(currentElements.map(el => [el.id, el]))
 
-      // Apply additions and updates
+      // Apply additions and updates from the delta
       event.changes.keys.forEach((change, key) => {
         if (change.action === 'add' || change.action === 'update') {
           const serverEl = yElements.get(key)
           if (serverEl) {
             const cleaned = cleanElementForExcalidraw(serverEl)
-            currentMap.set(key, cleaned as any)
+            currentMap.set(key, cleaned)
           }
         } else if (change.action === 'delete') {
           currentMap.delete(key)
         }
       })
 
-      const merged = Array.from(currentMap.values())
+      // Sort by _zIndex using Yjs insertion order as fallback for elements without it
+      const orderedEntries: Array<{ key: string; zIndex: number }> = []
+      let insertionIdx = 0
+      yElements.forEach((_: any, key: string) => {
+        const el = currentMap.get(key) as any
+        if (el) {
+          const zIndex = typeof el._zIndex === 'number' ? el._zIndex : insertionIdx
+          orderedEntries.push({ key, zIndex })
+        }
+        insertionIdx++
+      })
+      // Also include any remaining currentMap entries not in yElements (shouldn't happen, but safe)
+      currentMap.forEach((_: any, key: string) => {
+        if (!yElements.has(key)) {
+          orderedEntries.push({ key, zIndex: insertionIdx++ })
+        }
+      })
+      orderedEntries.sort((a, b) => a.zIndex - b.zIndex)
+
+      const merged = orderedEntries
+        .map(e => currentMap.get(e.key))
+        .filter(Boolean)
+        .map(stripZIndex)
       const converted = convertElementsPreservingImageProps(merged as any)
       applySceneUpdateWithoutAutoSync(api, {
         elements: converted,
         captureUpdate: CaptureUpdateAction.NEVER
       })
 
-      // Update prev tracking with current nonces
+      // Update prev tracking with current nonces AND order
       const newPrev = new Map<string, number>()
-      api.getSceneElements().forEach(el => {
+      const newOrder = new Map<string, number>()
+      api.getSceneElements().forEach((el, idx) => {
         newPrev.set(el.id, el.versionNonce)
+        newOrder.set(el.id, idx)
       })
       prevElementNoncesRef.current = newPrev
+      prevElementOrderRef.current = newOrder
 
+      // Keep suppress active long enough to block any deferred onChange callbacks
+      // from Excalidraw's render cycle after updateScene
       setTimeout(() => {
         suppressYjsSyncRef.current = false
-      }, 0)
+      }, 100)
     })
 
     // Observe Y.Map 'files' changes → apply image files to Excalidraw canvas
@@ -497,9 +609,27 @@ function App(): JSX.Element {
       }
     }
 
-    // Try loading files once synced; also retry when API becomes available
+    // Once Yjs has fully synced with the server, load all existing elements and files.
+    // This covers the case where the Excalidraw API was already ready before the sync completed
+    // (so the observe callback may have bailed out with `!api`).
     provider.on('synced', () => {
       loadInitialFiles()
+      const api = excalidrawAPIRef.current
+      if (api) {
+        applyYjsElementsToCanvas(api, 'synced')
+        // Build prev tracking from the now-applied canvas so handleYjsSync
+        // sees "no diff" and does not delete server elements
+        const newPrev = new Map<string, number>()
+        const newOrder = new Map<string, number>()
+        api.getSceneElements().forEach((el, idx) => {
+          newPrev.set(el.id, el.versionNonce)
+          newOrder.set(el.id, idx)
+        })
+        prevElementNoncesRef.current = newPrev
+        prevElementOrderRef.current = newOrder
+      }
+      console.log('[Yjs] Initial sync complete — enabling local→server push')
+      initialSyncDoneRef.current = true
     })
 
     return () => {
@@ -513,6 +643,7 @@ function App(): JSX.Element {
   // ── Yjs onChange handler: push local changes to Y.Map ────────
   const handleYjsSync = useCallback(() => {
     if (suppressYjsSyncRef.current) return
+    if (!initialSyncDoneRef.current) return
     const api = excalidrawAPIRef.current
     const yElements = yElementsRef.current
     const yFiles = yFilesRef.current
@@ -521,7 +652,9 @@ function App(): JSX.Element {
 
     const currentElements = api.getSceneElements()
     const currentNonces = new Map<string, number>()
+    const currentOrder = new Map<string, number>()
     const prev = prevElementNoncesRef.current
+    const prevOrder = prevElementOrderRef.current
 
     doc.transact(() => {
       // Sync files FIRST so remote clients have image data before receiving the element
@@ -546,12 +679,16 @@ function App(): JSX.Element {
         }
       }
 
-      // Then sync elements
-      currentElements.forEach(el => {
+      // Then sync elements (with _zIndex for layer ordering)
+      currentElements.forEach((el, index) => {
         currentNonces.set(el.id, el.versionNonce)
+        currentOrder.set(el.id, index)
         const prevNonce = prev.get(el.id)
-        if (prevNonce === undefined || prevNonce !== el.versionNonce) {
-          yElements.set(el.id, { ...el })
+        const prevIdx = prevOrder.get(el.id)
+        const nonceChanged = prevNonce === undefined || prevNonce !== el.versionNonce
+        const orderChanged = prevIdx !== index
+        if (nonceChanged || orderChanged) {
+          yElements.set(el.id, { ...el, _zIndex: index })
         }
       })
 
@@ -564,6 +701,7 @@ function App(): JSX.Element {
     }, 'local')
 
     prevElementNoncesRef.current = currentNonces
+    prevElementOrderRef.current = currentOrder
   }, [])
 
   // WebSocket connection (legacy - for MCP notifications like viewport, export, mermaid)
@@ -591,7 +729,11 @@ function App(): JSX.Element {
       const result: ApiResponse = await response.json()
 
       if (result.success && result.elements && result.elements.length > 0) {
-        const cleanedElements = result.elements.map(cleanElementForExcalidraw)
+        // Server returns elements sorted by _zIndex; clean and convert preserving order
+        const cleanedElements = result.elements
+          .map(cleanElementForExcalidraw)
+          .sort((a: any, b: any) => (a._zIndex ?? 0) - (b._zIndex ?? 0))
+          .map(stripZIndex)
         const convertedElements = convertElementsPreservingImageProps(cleanedElements)
         if (excalidrawAPI) {
           applySceneUpdateWithoutAutoSync(excalidrawAPI, {

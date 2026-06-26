@@ -87,12 +87,15 @@ wss.on('connection', (ws: WebSocket) => {
   clients.add(ws);
   logger.info('New WebSocket connection established');
 
-  // Send current elements to new client
+  // Send current elements to new client (sorted by _zIndex to preserve layer order)
   const filesObj: Record<string, ExcalidrawFile> = {};
   files.forEach((f, id) => { filesObj[id] = f; });
+  const elementsForClient = Array.from(elements.values())
+    .map((el, i) => ({ ...el, _zIndex: typeof el._zIndex === 'number' ? el._zIndex : i }))
+    .sort((a, b) => (a._zIndex ?? 0) - (b._zIndex ?? 0));
   const initialMessage: InitialElementsMessage & { files?: Record<string, ExcalidrawFile> } = {
     type: 'initial_elements',
-    elements: Array.from(elements.values()),
+    elements: elementsForClient,
     ...(files.size > 0 ? { files: filesObj } : {})
   };
   ws.send(JSON.stringify(initialMessage));
@@ -236,10 +239,18 @@ const UpdateElementSchema = z.object({
 app.get('/api/elements', (req: Request, res: Response) => {
   try {
     const elementsArray = Array.from(elements.values());
+    // Assign _zIndex based on insertion order for elements that don't have it,
+    // then sort so callers receive elements in correct layer order.
+    const sortedElements = elementsArray
+      .map((el, i) => ({
+        ...el,
+        _zIndex: typeof el._zIndex === 'number' ? el._zIndex : i
+      }))
+      .sort((a, b) => (a._zIndex ?? 0) - (b._zIndex ?? 0));
     res.json({
       success: true,
-      elements: elementsArray,
-      count: elementsArray.length
+      elements: sortedElements,
+      count: sortedElements.length
     });
   } catch (error) {
     logger.error('Error fetching elements:', error);
@@ -264,7 +275,8 @@ app.post('/api/elements', (req: Request, res: Response) => {
       fontFamily: normalizeFontFamily(params.fontFamily),
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
-      version: 1
+      version: 1,
+      _zIndex: elements.size
     };
 
     // Resolve arrow bindings against existing elements
@@ -635,7 +647,8 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
 
     const createdElements: ServerElement[] = [];
 
-    elementsToCreate.forEach(elementData => {
+    const baseZIndex = elements.size;
+    elementsToCreate.forEach((elementData, i) => {
       const params = CreateElementSchema.parse(elementData);
       // Prioritize passed ID (for MCP sync), otherwise generate new ID
       const id = params.id || generateId();
@@ -645,7 +658,8 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
         fontFamily: normalizeFontFamily(params.fontFamily),
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
-        version: 1
+        version: 1,
+        _zIndex: baseZIndex + i
       };
 
       createdElements.push(element);

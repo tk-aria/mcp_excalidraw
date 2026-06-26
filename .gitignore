@@ -21,3 +21,9 @@ public/dist/
 *.excalidraw
 
 docs/
+
+# Test artifacts
+.playwright-mcp/
+all-elements-fitted.png
+all-elements.png
+initial-load.png

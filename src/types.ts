@@ -130,6 +130,7 @@ export interface ServerElement extends Omit<ExcalidrawElementBase, 'id'> {
   syncedAt?: string;
   source?: string;
   syncTimestamp?: string;
+  _zIndex?: number;
   text?: string;
   originalText?: string;
   fontSize?: number;
