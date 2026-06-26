@@ -8,7 +8,7 @@ import dotenv from 'dotenv';
 import logger from './utils/logger.js';
 import {
   elements as _legacyElements,
-  files,
+  files as _legacyFiles,
   snapshots,
   generateId,
   EXCALIDRAW_ELEMENT_TYPES,
@@ -25,7 +25,7 @@ import {
   Snapshot,
   normalizeFontFamily
 } from './types.js';
-import { YjsElementsMap, setupYjsWebSocket } from './yjs-sync.js';
+import { YjsElementsMap, YjsFilesMap, setupYjsWebSocket } from './yjs-sync.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
 
@@ -41,6 +41,8 @@ const wss = new WebSocketServer({ noServer: true });
 
 // Yjs-backed elements storage (drop-in replacement for Map<string, ServerElement>)
 const elements = new YjsElementsMap();
+// Yjs-backed file storage (images sync via CRDT alongside elements)
+const files = new YjsFilesMap();
 
 // Middleware
 app.use(cors());

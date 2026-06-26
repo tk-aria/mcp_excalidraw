@@ -19,6 +19,9 @@ import logger from './utils/logger.js';
 export const ydoc = new Y.Doc();
 export const yElements: Y.Map<ServerElement> = ydoc.getMap('elements');
 
+// Files (images) are now also CRDT-backed so they sync between clients automatically
+export const yFiles: Y.Map<any> = ydoc.getMap('files');
+
 // ── Awareness (cursor positions etc. — optional future use) ──────
 export const awareness = new awarenessProtocol.Awareness(ydoc);
 
@@ -80,6 +83,65 @@ export class YjsElementsMap {
   }
 
   [Symbol.iterator](): IterableIterator<[string, ServerElement]> {
+    return this.entries();
+  }
+}
+
+// ── Map-compatible wrapper for files (images) ───────────────────
+export class YjsFilesMap {
+  get size(): number {
+    return yFiles.size;
+  }
+
+  get(key: string): any | undefined {
+    return yFiles.get(key);
+  }
+
+  has(key: string): boolean {
+    return yFiles.has(key);
+  }
+
+  set(key: string, value: any): this {
+    ydoc.transact(() => {
+      yFiles.set(key, value);
+    }, 'server');
+    return this;
+  }
+
+  delete(key: string): boolean {
+    if (!yFiles.has(key)) return false;
+    ydoc.transact(() => {
+      yFiles.delete(key);
+    }, 'server');
+    return true;
+  }
+
+  clear(): void {
+    ydoc.transact(() => {
+      const keys = Array.from(yFiles.keys());
+      keys.forEach(k => yFiles.delete(k));
+    }, 'server');
+  }
+
+  values(): IterableIterator<any> {
+    return yFiles.values();
+  }
+
+  keys(): IterableIterator<string> {
+    return yFiles.keys();
+  }
+
+  forEach(callback: (value: any, key: string, map: any) => void): void {
+    yFiles.forEach((value, key) => {
+      callback(value, key, this);
+    });
+  }
+
+  entries(): IterableIterator<[string, any]> {
+    return yFiles.entries() as IterableIterator<[string, any]>;
+  }
+
+  [Symbol.iterator](): IterableIterator<[string, any]> {
     return this.entries();
   }
 }

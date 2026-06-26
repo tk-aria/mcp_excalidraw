@@ -276,6 +276,18 @@ function App(): JSX.Element {
     // When excalidrawAPI becomes available, apply any Yjs elements that arrived
     // before the API was ready (initial sync race condition fix)
     if (excalidrawAPI && yElementsRef.current) {
+      // Load existing files first so image elements render correctly
+      const yFiles = yFilesRef.current
+      if (yFiles && yFiles.size > 0) {
+        const existingFiles: any[] = []
+        yFiles.forEach((file: any) => {
+          existingFiles.push(file)
+          prevFileIdsRef.current.add(file.id)
+        })
+        console.log(`[Yjs] API ready — loading ${existingFiles.length} existing file(s)`)
+        excalidrawAPI.addFiles(existingFiles)
+      }
+
       const yElements = yElementsRef.current
       if (yElements.size > 0) {
         console.log(`[Yjs] API ready — applying ${yElements.size} existing elements`)
@@ -314,6 +326,7 @@ function App(): JSX.Element {
   const ydocRef = useRef<Y.Doc | null>(null)
   const yjsProviderRef = useRef<WebsocketProvider | null>(null)
   const yElementsRef = useRef<Y.Map<any> | null>(null)
+  const yFilesRef = useRef<Y.Map<any> | null>(null)
   const suppressYjsSyncRef = useRef<boolean>(false) // prevent infinite loop
   const prevElementNoncesRef = useRef<Map<string, number>>(new Map()) // id → versionNonce for change detection
   const prevFileIdsRef = useRef<Set<string>>(new Set()) // track uploaded file IDs
@@ -344,6 +357,8 @@ function App(): JSX.Element {
     ydocRef.current = doc
     const yElements = doc.getMap('elements')
     yElementsRef.current = yElements
+    const yFiles = doc.getMap('files')
+    yFilesRef.current = yFiles
 
     const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
 
@@ -447,6 +462,46 @@ function App(): JSX.Element {
       }, 0)
     })
 
+    // Observe Y.Map 'files' changes → apply image files to Excalidraw canvas
+    yFiles.observe((event: Y.YMapEvent<any>) => {
+      if (event.transaction.origin === 'local') return
+      const api = excalidrawAPIRef.current
+      if (!api) return
+
+      const newFiles: any[] = []
+      event.changes.keys.forEach((change, key) => {
+        if (change.action === 'add' || change.action === 'update') {
+          const file = yFiles.get(key)
+          if (file) newFiles.push(file)
+        }
+      })
+      if (newFiles.length > 0) {
+        console.log(`[Yjs] Received ${newFiles.length} file(s) from remote`)
+        api.addFiles(newFiles)
+        newFiles.forEach(f => prevFileIdsRef.current.add(f.id))
+      }
+    })
+
+    // Load existing files from yFiles on connection (handles late-joining clients)
+    const loadInitialFiles = () => {
+      const api = excalidrawAPIRef.current
+      if (!api || yFiles.size === 0) return
+      const existingFiles: any[] = []
+      yFiles.forEach((file: any) => {
+        existingFiles.push(file)
+        prevFileIdsRef.current.add(file.id)
+      })
+      if (existingFiles.length > 0) {
+        console.log(`[Yjs] Loading ${existingFiles.length} existing file(s)`)
+        api.addFiles(existingFiles)
+      }
+    }
+
+    // Try loading files once synced; also retry when API becomes available
+    provider.on('synced', () => {
+      loadInitialFiles()
+    })
+
     return () => {
       if (fallbackTimer) clearTimeout(fallbackTimer)
       provider.disconnect()
@@ -460,56 +515,55 @@ function App(): JSX.Element {
     if (suppressYjsSyncRef.current) return
     const api = excalidrawAPIRef.current
     const yElements = yElementsRef.current
+    const yFiles = yFilesRef.current
     const doc = ydocRef.current
-    if (!api || !yElements || !doc) return
+    if (!api || !yElements || !yFiles || !doc) return
 
     const currentElements = api.getSceneElements()
     const currentNonces = new Map<string, number>()
     const prev = prevElementNoncesRef.current
-    let hasChanges = false
 
     doc.transact(() => {
-      // Only write elements whose versionNonce changed
-      // versionNonce is regenerated on EVERY element modification in Excalidraw
+      // Sync files FIRST so remote clients have image data before receiving the element
+      const allFiles = api.getFiles()
+      const allFileIds = Object.keys(allFiles)
+      if (allFileIds.length > 0) {
+        const prevIds = prevFileIdsRef.current
+        const newFileIds = allFileIds.filter(id => !prevIds.has(id))
+        if (newFileIds.length > 0) {
+          console.log(`[Yjs] Pushing ${newFileIds.length} new file(s) to Y.Map`)
+          newFileIds.forEach(id => {
+            yFiles.set(id, allFiles[id])
+            prevIds.add(id)
+          })
+          // Also upload to server REST API for non-Yjs clients
+          const filesToUpload = newFileIds.map(id => allFiles[id])
+          fetch('/api/files', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ files: filesToUpload })
+          }).catch(err => console.error('[Yjs] Failed to upload files to REST:', err))
+        }
+      }
+
+      // Then sync elements
       currentElements.forEach(el => {
         currentNonces.set(el.id, el.versionNonce)
         const prevNonce = prev.get(el.id)
         if (prevNonce === undefined || prevNonce !== el.versionNonce) {
           yElements.set(el.id, { ...el })
-          hasChanges = true
         }
       })
 
-      // Delete elements that are no longer in the scene (eraser, delete key)
+      // Delete elements that are no longer in the scene
       prev.forEach((_, id) => {
         if (!currentNonces.has(id) && yElements.has(id)) {
           yElements.delete(id)
-          hasChanges = true
         }
       })
     }, 'local')
 
     prevElementNoncesRef.current = currentNonces
-
-    // Sync new files (images) to server via REST API
-    // Excalidraw stores image binary data separately from elements
-    if (hasChanges) {
-      const files = api.getFiles()
-      const fileIds = Object.keys(files)
-      if (fileIds.length > 0) {
-        const prev = prevFileIdsRef.current
-        const newFiles = fileIds.filter(id => !prev.has(id))
-        if (newFiles.length > 0) {
-          const filesToUpload = newFiles.map(id => files[id])
-          fetch('/api/files', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ files: filesToUpload })
-          }).catch(err => console.error('[Yjs] Failed to upload files:', err))
-          newFiles.forEach(id => prev.add(id))
-        }
-      }
-    }
   }, [])
 
   // WebSocket connection (legacy - for MCP notifications like viewport, export, mermaid)
