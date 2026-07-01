@@ -18,7 +18,7 @@ services:
     image: mcp-excalidraw-canvas:latest
     container_name: mcp-excalidraw-canvas
     ports:
-      - "3000:3000"
+      - "${PORT:-3000}:3000"
     environment:
       - NODE_ENV=production
       - PORT=3000
