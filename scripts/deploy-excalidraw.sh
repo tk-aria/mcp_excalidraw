@@ -114,7 +114,7 @@ import json, sys
 with open('$target') as f:
     cfg = json.load(f)
 cfg.setdefault('mcpServers', {})
-cfg['mcpServers']['excalidraw'] = {'type': 'http', 'url': '$mcp_url'}
+cfg['mcpServers']['excalidraw'] = {'type': 'streamable-http', 'url': '$mcp_url'}
 json.dump(cfg, sys.stdout, indent=2, ensure_ascii=False)
 print()
 ") || { echo "Error: failed to update ${target}" >&2; return 1; }
@@ -122,7 +122,7 @@ print()
     else
       python3 -c "
 import json, sys
-json.dump({'mcpServers': {'excalidraw': {'type': 'http', 'url': '$mcp_url'}}}, sys.stdout, indent=2)
+json.dump({'mcpServers': {'excalidraw': {'type': 'streamable-http', 'url': '$mcp_url'}}}, sys.stdout, indent=2)
 print()
 " > "$target"
     fi
@@ -135,7 +135,7 @@ import json, sys
 with open('$target') as f:
     cfg = json.load(f)
 cfg.setdefault('mcpServers', {})
-cfg['mcpServers']['excalidraw'] = {'type': 'http', 'url': '$mcp_url'}
+cfg['mcpServers']['excalidraw'] = {'type': 'streamable-http', 'url': '$mcp_url'}
 json.dump(cfg, sys.stdout, indent=2, ensure_ascii=False)
 print()
 ") || { echo "Error: failed to update ${target}" >&2; return 1; }
@@ -143,7 +143,7 @@ print()
     else
       python3 -c "
 import json, sys
-json.dump({'mcpServers': {'excalidraw': {'type': 'http', 'url': '$mcp_url'}}}, sys.stdout, indent=2)
+json.dump({'mcpServers': {'excalidraw': {'type': 'streamable-http', 'url': '$mcp_url'}}}, sys.stdout, indent=2)
 print()
 " > "$target"
     fi
@@ -215,5 +215,5 @@ if [[ "$SKIP_MCP" != "true" ]]; then
 else
   echo ""
   echo "To configure Claude Code manually:"
-  echo "    claude mcp add --transport http -s project excalidraw ${MCP_URL}"
+  echo "    claude mcp add --transport streamable-http -s project excalidraw ${MCP_URL}"
 fi
