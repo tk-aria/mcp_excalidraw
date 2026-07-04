@@ -5,7 +5,8 @@ import {
   CaptureUpdateAction,
   ExcalidrawImperativeAPI,
   exportToBlob,
-  exportToSvg
+  exportToSvg,
+  restoreLibraryItems
 } from '@excalidraw/excalidraw'
 import type { ExcalidrawElement, NonDeleted, NonDeletedExcalidrawElement } from '@excalidraw/excalidraw/types/element/types'
 import { convertMermaidToExcalidraw, DEFAULT_MERMAID_CONFIG } from './utils/mermaidConverter'
@@ -67,6 +68,21 @@ interface WebSocketMessage {
   source?: string;
   mermaidDiagram?: string;
   config?: MermaidConfig;
+  // Library messages
+  requestId?: string;
+  libraryData?: any;
+  itemIndex?: number;
+  itemName?: string;
+  x?: number;
+  y?: number;
+  // Viewport/export messages
+  scrollToContent?: boolean;
+  scrollToElementId?: string;
+  zoom?: number;
+  offsetX?: number;
+  offsetY?: number;
+  format?: string;
+  background?: boolean;
 }
 
 interface ApiResponse {
@@ -742,7 +758,8 @@ function App(): JSX.Element {
                   elements,
                   appState: {
                     ...appState,
-                    exportBackground: data.background !== false
+                    exportBackground: data.background !== false,
+                    exportEmbedScene: true
                   },
                   files
                 })
@@ -761,7 +778,8 @@ function App(): JSX.Element {
                   elements,
                   appState: {
                     ...appState,
-                    exportBackground: data.background !== false
+                    exportBackground: data.background !== false,
+                    exportEmbedScene: true
                   },
                   files,
                   mimeType: 'image/png'
@@ -875,6 +893,151 @@ function App(): JSX.Element {
                   error: (viewportError as Error).message
                 })
               }).catch(() => { })
+            }
+          }
+          break
+
+        case 'library_add':
+          if (data.requestId && data.libraryData) {
+            try {
+              const libItems = data.libraryData.libraryItems || data.libraryData.library
+              if (!libItems) throw new Error('No libraryItems found in library data')
+
+              const restored = restoreLibraryItems(libItems, 'published')
+
+              await excalidrawAPI.updateLibrary({
+                libraryItems: restored,
+                merge: true,
+                prompt: false,
+                openLibraryMenu: false,
+                defaultStatus: 'published'
+              })
+
+              await fetch('/api/library/add/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: data.requestId,
+                  itemCount: restored.length,
+                  itemNames: restored.map((item: any) => item.name || `item-${item.id}`)
+                })
+              })
+            } catch (libError) {
+              console.error('Library add failed:', libError)
+              await fetch('/api/library/add/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: data.requestId,
+                  error: (libError as Error).message
+                })
+              }).catch(() => {})
+            }
+          }
+          break
+
+        case 'library_get':
+          if (data.requestId) {
+            try {
+              const libraryItems = await excalidrawAPI.updateLibrary({
+                libraryItems: (current) => current,
+                merge: false,
+                prompt: false
+              })
+
+              const items = libraryItems.map((item: any, index: number) => ({
+                index,
+                id: item.id,
+                name: item.name || `item-${index}`,
+                status: item.status,
+                elementCount: item.elements?.length || 0
+              }))
+
+              await fetch('/api/library/items/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: data.requestId,
+                  items
+                })
+              })
+            } catch (getError) {
+              console.error('Library get failed:', getError)
+              await fetch('/api/library/items/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: data.requestId,
+                  error: (getError as Error).message
+                })
+              }).catch(() => {})
+            }
+          }
+          break
+
+        case 'library_use':
+          if (data.requestId) {
+            try {
+              const allLibItems = await excalidrawAPI.updateLibrary({
+                libraryItems: (current) => current,
+                merge: false,
+                prompt: false
+              })
+
+              let targetItem: any = null
+              if (data.itemIndex !== undefined && data.itemIndex < allLibItems.length) {
+                targetItem = allLibItems[data.itemIndex]
+              } else if (data.itemName) {
+                const searchName = data.itemName.toLowerCase()
+                targetItem = allLibItems.find((item: any) =>
+                  (item.name || '').toLowerCase().includes(searchName)
+                )
+              }
+
+              if (!targetItem) {
+                throw new Error(`Library item not found: ${data.itemName || `index ${data.itemIndex}`}`)
+              }
+
+              const offsetX = data.x ?? 0
+              const offsetY = data.y ?? 0
+              const placedElements = targetItem.elements.map((el: any) => ({
+                ...el,
+                x: (el.x || 0) + offsetX,
+                y: (el.y || 0) + offsetY,
+                id: `${el.id}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+              }))
+
+              const currentElements = excalidrawAPI.getSceneElements()
+              const converted = convertElementsPreservingImageProps(placedElements as any)
+              applySceneUpdateWithoutAutoSync(excalidrawAPI, {
+                elements: [...currentElements, ...converted],
+                captureUpdate: CaptureUpdateAction.IMMEDIATELY
+              })
+
+              await fetch('/api/library/items/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: data.requestId,
+                  items: [{
+                    name: targetItem.name || `item-${data.itemIndex}`,
+                    elementCount: placedElements.length,
+                    placedAt: { x: offsetX, y: offsetY }
+                  }]
+                })
+              })
+
+              await syncToBackend({ silent: true })
+            } catch (useError) {
+              console.error('Library use failed:', useError)
+              await fetch('/api/library/items/result', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  requestId: data.requestId,
+                  error: (useError as Error).message
+                })
+              }).catch(() => {})
             }
           }
           break

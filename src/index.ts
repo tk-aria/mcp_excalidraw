@@ -5,7 +5,7 @@ process.env.NODE_DISABLE_COLORS = '1';
 process.env.NO_COLOR = '1';
 
 import { fileURLToPath } from "url";
-import { deflateSync } from 'zlib';
+import { deflateSync, inflateSync } from 'zlib';
 import { webcrypto } from 'crypto';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -34,18 +34,41 @@ import fetch from 'node-fetch';
 dotenv.config();
 
 // Safe file path validation to prevent path traversal attacks
-const ALLOWED_EXPORT_DIR = process.env.EXCALIDRAW_EXPORT_DIR || process.cwd();
+const ALLOWED_EXPORT_DIRS = [
+  process.env.EXCALIDRAW_EXPORT_DIR || process.cwd(),
+  '/tmp',
+  ...(process.env.EXCALIDRAW_EXTRA_DIRS ? process.env.EXCALIDRAW_EXTRA_DIRS.split(':') : [])
+].map(d => path.resolve(d));
 
 function sanitizeFilePath(filePath: string): string {
   const resolved = path.resolve(filePath);
-  const allowedDir = path.resolve(ALLOWED_EXPORT_DIR);
-  if (!resolved.startsWith(allowedDir + path.sep) && resolved !== allowedDir) {
+  const allowed = ALLOWED_EXPORT_DIRS.some(dir =>
+    resolved.startsWith(dir + path.sep) || resolved === dir
+  );
+  if (!allowed) {
     throw new Error(
-      `Path traversal blocked: "${filePath}" resolves outside the allowed directory "${allowedDir}". ` +
-      `Set EXCALIDRAW_EXPORT_DIR to change the allowed base directory.`
+      `Path traversal blocked: "${filePath}" resolves outside allowed directories [${ALLOWED_EXPORT_DIRS.join(', ')}]. ` +
+      `Set EXCALIDRAW_EXPORT_DIR or EXCALIDRAW_EXTRA_DIRS to add more.`
     );
   }
   return resolved;
+}
+
+// CRC32 for PNG tEXt chunk embedding
+function crc32(buf: Buffer): number {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c;
+  }
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) {
+    crc = table[(crc ^ buf[i]!) & 0xFF]! ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
 }
 
 // Express server configuration
@@ -689,7 +712,7 @@ const tools: Tool[] = [
   },
   {
     name: 'export_to_image',
-    description: 'Export the current canvas to PNG or SVG image. Requires the canvas frontend to be open in a browser.',
+    description: 'Export the current canvas to PNG or SVG image with embedded scene data (the image can be re-imported to restore the diagram). Requires the canvas frontend to be open in a browser.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -820,8 +843,117 @@ const tools: Tool[] = [
         }
       }
     }
+  },
+  {
+    name: 'search_libraries',
+    description: 'Search the public Excalidraw library repository (libraries.excalidraw.com) for reusable shape collections. Returns library metadata — use add_library to install one.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        query: {
+          type: 'string',
+          description: 'Search query (e.g. "aws", "network", "flowchart", "icons")'
+        },
+        limit: {
+          type: 'number',
+          description: 'Max results to return (default: 10, max: 50)'
+        }
+      }
+    }
+  },
+  {
+    name: 'add_library',
+    description: 'Install a public Excalidraw library by its source path. The library items become available in the canvas library panel. Use search_libraries to find libraries first.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        source: {
+          type: 'string',
+          description: 'Library source path from search_libraries (e.g. "jumpingrivers/r.excalidrawlib") or full URL'
+        }
+      },
+      required: ['source']
+    }
+  },
+  {
+    name: 'use_library_item',
+    description: 'Place a library item (shape/icon) onto the canvas at the specified position. The item must have been added via add_library first. Use get_library_items to see available items.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        itemName: {
+          type: 'string',
+          description: 'Name (or partial name) of the library item to place'
+        },
+        itemIndex: {
+          type: 'number',
+          description: 'Index of the library item (alternative to itemName). Use get_library_items to see indices.'
+        },
+        x: {
+          type: 'number',
+          description: 'X coordinate to place the item (default: 0)'
+        },
+        y: {
+          type: 'number',
+          description: 'Y coordinate to place the item (default: 0)'
+        }
+      }
+    }
+  },
+  {
+    name: 'get_library_items',
+    description: 'List all library items currently loaded in the canvas. Shows item names and indices for use with use_library_item.',
+    inputSchema: {
+      type: 'object',
+      properties: {}
+    }
+  },
+  {
+    name: 'export_image_with_scene',
+    description: 'Export the canvas to PNG or SVG with embedded Excalidraw scene data. The exported file can be re-imported later to restore the full editable diagram. PNG embeds data in a tEXt chunk; SVG embeds it in a <!-- payload-type:excalidraw --> comment (same format as excalidraw.com).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        format: {
+          type: 'string',
+          enum: ['png', 'svg'],
+          description: 'Image format'
+        },
+        filePath: {
+          type: 'string',
+          description: 'File path to save the image (required)'
+        },
+        background: {
+          type: 'boolean',
+          description: 'Include background in export (default: true)'
+        }
+      },
+      required: ['format', 'filePath']
+    }
+  },
+  {
+    name: 'import_from_image',
+    description: 'Import an Excalidraw scene from a PNG or SVG file that has embedded scene data (created by export_image_with_scene or Excalidraw app "Export with scene data"). Extracts the embedded JSON and restores the diagram on canvas.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        filePath: {
+          type: 'string',
+          description: 'Path to the PNG or SVG file with embedded scene data'
+        },
+        mode: {
+          type: 'string',
+          enum: ['replace', 'merge'],
+          description: '"replace" clears canvas first, "merge" appends to existing elements'
+        }
+      },
+      required: ['filePath', 'mode']
+    }
   }
 ];
+
+// Factory function to create a configured MCP server instance
+export function createMcpServer(): Server {
 
 // Initialize MCP server
 const server = new Server(
@@ -2214,6 +2346,409 @@ server.setRequestHandler(CallToolRequestSchema, async (request: CallToolRequest)
         };
       }
 
+      case 'search_libraries': {
+        const query = (args?.query as string) || '';
+        const limit = Math.min((args?.limit as number) || 10, 50);
+
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/library/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+        const result = await response.json() as ApiResponse & { libraries?: any[]; total?: number; query?: string };
+
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || 'Library search failed');
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Found ${result.total} libraries${query ? ` matching "${query}"` : ''}:\n\n${
+              (result.libraries || []).map((lib: any, i: number) =>
+                `${i + 1}. **${lib.name}** (source: \`${lib.source}\`)\n   ${lib.description || 'No description'}\n   Authors: ${(lib.authors || []).map((a: any) => a.name).join(', ')}`
+              ).join('\n\n')
+            }`
+          }]
+        };
+      }
+
+      case 'add_library': {
+        const source = args?.source as string;
+        if (!source) throw new Error('source is required');
+
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/library/add`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source })
+        });
+        const result = await response.json() as any;
+
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || 'Failed to add library');
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Library added successfully!\n\nItems loaded: ${result.itemCount}\nItem names: ${(result.itemNames || []).join(', ')}\n\nUse get_library_items to see all available items, then use_library_item to place them on the canvas.`
+          }]
+        };
+      }
+
+      case 'get_library_items': {
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/library/items`);
+        const result = await response.json() as any;
+
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || 'Failed to get library items');
+        }
+
+        const items = result.items || [];
+        if (items.length === 0) {
+          return {
+            content: [{
+              type: 'text',
+              text: 'No library items loaded. Use search_libraries to find libraries, then add_library to install one.'
+            }]
+          };
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Library items (${items.length}):\n\n${
+              items.map((item: any, i: number) =>
+                `${i}. **${item.name}** (${item.elementCount} elements, status: ${item.status})`
+              ).join('\n')
+            }\n\nUse use_library_item with itemIndex or itemName to place an item on the canvas.`
+          }]
+        };
+      }
+
+      case 'use_library_item': {
+        const itemName = args?.itemName as string | undefined;
+        const itemIndex = args?.itemIndex as number | undefined;
+        const x = (args?.x as number) ?? 0;
+        const y = (args?.y as number) ?? 0;
+
+        const response = await fetch(`${EXPRESS_SERVER_URL}/api/library/use`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ itemName, itemIndex, x, y })
+        });
+        const result = await response.json() as any;
+
+        if (!response.ok || !result.success) {
+          throw new Error(result.error || 'Failed to use library item');
+        }
+
+        const placed = result.items?.[0];
+        return {
+          content: [{
+            type: 'text',
+            text: `Placed library item "${placed?.name}" (${placed?.elementCount} elements) at (${placed?.placedAt?.x}, ${placed?.placedAt?.y})`
+          }]
+        };
+      }
+
+      case 'export_image_with_scene': {
+        const params = z.object({
+          format: z.enum(['png', 'svg']),
+          filePath: z.string(),
+          background: z.boolean().optional()
+        }).parse(args);
+
+        logger.info('Exporting image with embedded scene data', { format: params.format });
+
+        // 1. Get image data from frontend
+        const imgResponse = await fetch(`${EXPRESS_SERVER_URL}/api/export/image`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            format: params.format,
+            background: params.background ?? true
+          })
+        });
+
+        if (!imgResponse.ok) {
+          const errData = await imgResponse.json() as ApiResponse;
+          throw new Error(errData.error || `Image export failed: ${imgResponse.status}`);
+        }
+
+        const imgResult = await imgResponse.json() as { success: boolean; format: string; data: string };
+
+        // 2. Get scene JSON
+        const sceneResponse = await fetch(`${EXPRESS_SERVER_URL}/api/elements`);
+        if (!sceneResponse.ok) {
+          throw new Error(`Failed to fetch elements: ${sceneResponse.status}`);
+        }
+        const sceneApiData = await sceneResponse.json() as ApiResponse;
+        const sceneElements = sceneApiData.elements || [];
+
+        let sceneFiles: Record<string, any> = {};
+        try {
+          const filesResp = await fetch(`${EXPRESS_SERVER_URL}/api/files`);
+          if (filesResp.ok) {
+            const filesData = await filesResp.json() as any;
+            sceneFiles = filesData.files || {};
+          }
+        } catch { /* best effort */ }
+
+        const excalidrawScene = {
+          type: 'excalidraw',
+          version: 2,
+          source: 'mcp-excalidraw-server',
+          elements: sceneElements,
+          appState: { viewBackgroundColor: '#ffffff', gridSize: null },
+          ...(Object.keys(sceneFiles).length > 0 ? { files: sceneFiles } : {})
+        };
+
+        const sceneJson = JSON.stringify(excalidrawScene);
+        const safePath = sanitizeFilePath(params.filePath);
+
+        if (params.format === 'svg') {
+          // SVG: Excalidraw frontend already embeds scene data in native format
+          // (payload-start/payload-end with bstring+zlib compression).
+          // If native payload is present, save as-is. Otherwise add our format.
+          let svgData = imgResult.data;
+          if (!svgData.includes('<!-- payload-start -->')) {
+            const encodedScene = `<!-- payload-type:excalidraw payload-version:2 data-encoded:${encodeURIComponent(sceneJson)} -->`;
+            const closingIdx = svgData.lastIndexOf('</svg>');
+            if (closingIdx !== -1) {
+              svgData = svgData.slice(0, closingIdx) + '\n' + encodedScene + '\n' + svgData.slice(closingIdx);
+            } else {
+              svgData += '\n' + encodedScene;
+            }
+          }
+          fs.writeFileSync(safePath, svgData, 'utf-8');
+        } else {
+          // PNG: embed scene data as a tEXt chunk matching Excalidraw's native format
+          // Keyword: "application/vnd.excalidraw+json" (not "excalidraw")
+          // Value: JSON.stringify({version:"1", encoding:"bstring", compressed:true, encoded:<deflated>})
+          const pngBuffer = Buffer.from(imgResult.data, 'base64');
+
+          // Skip manual injection if the frontend already embedded the scene
+          // natively (exportEmbedScene: true) — avoid duplicate tEXt chunks.
+          const sceneKeyword = Buffer.from('application/vnd.excalidraw+json', 'latin1');
+          if (pngBuffer.includes(sceneKeyword)) {
+            fs.writeFileSync(safePath, pngBuffer);
+          } else {
+            // Compress scene JSON using deflate (same as Excalidraw's Si() function)
+            const deflated = deflateSync(Buffer.from(sceneJson, 'utf-8'));
+            // Convert to bstring (latin1) for JSON-safe storage
+            const bstringEncoded = deflated.toString('latin1');
+            const wrapper = JSON.stringify({
+              version: '1',
+              encoding: 'bstring',
+              compressed: true,
+              encoded: bstringEncoded
+            });
+
+            const keyword = Buffer.from('application/vnd.excalidraw+json\0', 'latin1');
+            const textData = Buffer.from(wrapper, 'latin1');
+            const chunkData = Buffer.concat([keyword, textData]);
+
+            // tEXt chunk = length(4) + type(4) + data + crc(4)
+            const chunkType = Buffer.from('tEXt', 'latin1');
+            const lengthBuf = Buffer.alloc(4);
+            lengthBuf.writeUInt32BE(chunkData.length, 0);
+
+            // CRC32 over type + data
+            const crcInput = Buffer.concat([chunkType, chunkData]);
+            const crc = crc32(crcInput);
+            const crcBuf = Buffer.alloc(4);
+            crcBuf.writeUInt32BE(crc >>> 0, 0);
+
+            const textChunk = Buffer.concat([lengthBuf, chunkType, chunkData, crcBuf]);
+
+            // Insert before IEND (last 12 bytes of a valid PNG)
+            const iendOffset = pngBuffer.length - 12;
+            const result = Buffer.concat([
+              pngBuffer.slice(0, iendOffset),
+              textChunk,
+              pngBuffer.slice(iendOffset)
+            ]);
+
+            fs.writeFileSync(safePath, result);
+          }
+        }
+
+        // Verify the written file actually contains embedded scene data
+        {
+          const written = fs.readFileSync(safePath);
+          const hasScene = params.format === 'svg'
+            ? (written.includes('payload-start') || written.includes('payload-type:excalidraw'))
+            : written.includes(Buffer.from('application/vnd.excalidraw+json', 'latin1'));
+          if (!hasScene) {
+            throw new Error(`Scene data embedding verification failed for ${safePath} — no embedded scene found in the exported ${params.format.toUpperCase()}`);
+          }
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Exported ${params.format.toUpperCase()} with embedded scene data to ${safePath} (${sceneElements.length} elements)`
+          }]
+        };
+      }
+
+      case 'import_from_image': {
+        const params = z.object({
+          filePath: z.string(),
+          mode: z.enum(['replace', 'merge'])
+        }).parse(args);
+
+        const safePath = sanitizeFilePath(params.filePath);
+        const ext = path.extname(safePath).toLowerCase();
+
+        logger.info('Importing scene from image', { path: safePath, ext });
+
+        let sceneData: any;
+
+        if (ext === '.svg') {
+          const svgContent = fs.readFileSync(safePath, 'utf-8');
+
+          // Method 1: Excalidraw native format (payload-start/payload-end with bstring+zlib)
+          const nativeMatch = svgContent.match(/<!-- payload-start -->([\s\S]*?)<!-- payload-end -->/);
+          if (nativeMatch) {
+            const b64 = nativeMatch[1]!.trim();
+            const rawBuf = Buffer.from(b64, 'base64');
+            const wrapper = JSON.parse(rawBuf.toString('latin1'));
+            if (wrapper.compressed && wrapper.encoded) {
+              const encodedBuf = Buffer.from(wrapper.encoded, 'latin1');
+              const decompressed = inflateSync(encodedBuf);
+              sceneData = JSON.parse(decompressed.toString('utf-8'));
+            } else if (wrapper.encoded) {
+              const innerBuf = Buffer.from(wrapper.encoded, 'base64');
+              sceneData = JSON.parse(innerBuf.toString('utf-8'));
+            }
+          }
+
+          // Method 2: Our custom data-encoded format
+          if (!sceneData) {
+            const payloadMatch = svgContent.match(/<!-- payload-type:excalidraw[^>]*data-encoded:([^>\s]+)\s*-->/);
+            if (payloadMatch) {
+              const decoded = decodeURIComponent(payloadMatch[1]!);
+              sceneData = JSON.parse(decoded);
+            }
+          }
+
+          // Method 3: JSON in <desc> tag
+          if (!sceneData) {
+            const descMatch = svgContent.match(/<desc>([\s\S]*?)<\/desc>/);
+            if (descMatch) {
+              try {
+                const parsed = JSON.parse(descMatch[1]!.trim());
+                if (parsed.type === 'excalidraw' || parsed.elements) {
+                  sceneData = parsed;
+                }
+              } catch { /* not excalidraw data */ }
+            }
+          }
+
+          if (!sceneData) {
+            throw new Error('No embedded Excalidraw scene data found in SVG. The file may be a plain SVG without embedded data.');
+          }
+        } else if (ext === '.png') {
+          const pngBuffer = fs.readFileSync(safePath);
+
+          // Parse PNG chunks to find tEXt chunk with keyword "excalidraw"
+          if (pngBuffer.slice(0, 8).toString('hex') !== '89504e470d0a1a0a') {
+            throw new Error('Not a valid PNG file');
+          }
+
+          let offset = 8; // skip PNG signature
+          let found = false;
+
+          while (offset < pngBuffer.length - 4) {
+            const chunkLength = pngBuffer.readUInt32BE(offset);
+            const chunkType = pngBuffer.slice(offset + 4, offset + 8).toString('latin1');
+
+            if (chunkType === 'tEXt' || chunkType === 'iTXt') {
+              const chunkDataStart = offset + 8;
+              const chunkDataBuf = pngBuffer.slice(chunkDataStart, chunkDataStart + chunkLength);
+
+              const nullIdx = chunkDataBuf.indexOf(0);
+              if (nullIdx !== -1) {
+                const keyword = chunkDataBuf.slice(0, nullIdx).toString('latin1');
+                const excalidrawKeywords = ['application/vnd.excalidraw+json', 'excalidraw'];
+                if (excalidrawKeywords.includes(keyword)) {
+                  // tEXt: keyword + null + text (latin1 encoded for bstring)
+                  const textContent = chunkDataBuf.slice(nullIdx + 1).toString('latin1');
+                  const parsed = JSON.parse(textContent);
+
+                  // Check if it's a bstring wrapper (Excalidraw native format)
+                  if (parsed.encoding === 'bstring' && parsed.compressed && parsed.encoded) {
+                    const encodedBuf = Buffer.from(parsed.encoded, 'latin1');
+                    const decompressed = inflateSync(encodedBuf);
+                    sceneData = JSON.parse(decompressed.toString('utf-8'));
+                  } else if (parsed.encoded) {
+                    const innerBuf = Buffer.from(parsed.encoded, 'base64');
+                    sceneData = JSON.parse(innerBuf.toString('utf-8'));
+                  } else if (parsed.type === 'excalidraw' || parsed.elements) {
+                    sceneData = parsed;
+                  }
+                  found = true;
+                  break;
+                }
+              }
+            }
+
+            if (chunkType === 'IEND') break;
+            offset += 12 + chunkLength; // length(4) + type(4) + data + crc(4)
+          }
+
+          if (!found || !sceneData) {
+            throw new Error('No embedded Excalidraw scene data found in PNG. The file may be a plain PNG without embedded data.');
+          }
+        } else {
+          throw new Error(`Unsupported file type: ${ext}. Expected .png or .svg`);
+        }
+
+        // Import the extracted scene
+        const importElements: ServerElement[] = Array.isArray(sceneData)
+          ? sceneData
+          : (sceneData.elements || []);
+
+        if (importElements.length === 0) {
+          throw new Error('Embedded scene data contains no elements');
+        }
+
+        if (params.mode === 'replace') {
+          await fetch(`${EXPRESS_SERVER_URL}/api/elements/clear`, { method: 'DELETE' });
+        }
+
+        const elementsToCreate = importElements.map(el => ({
+          ...el,
+          id: el.id || generateId(),
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          version: 1
+        }));
+
+        await batchCreateElementsOnCanvas(elementsToCreate);
+
+        // Import files if present
+        let importedFileCount = 0;
+        if (sceneData.files && typeof sceneData.files === 'object') {
+          const fileList = Object.values(sceneData.files);
+          if (fileList.length > 0) {
+            try {
+              await fetch(`${EXPRESS_SERVER_URL}/api/files`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(fileList)
+              });
+              importedFileCount = fileList.length;
+            } catch { /* best effort */ }
+          }
+        }
+
+        return {
+          content: [{
+            type: 'text',
+            text: `Imported ${elementsToCreate.length} elements${importedFileCount > 0 ? ` and ${importedFileCount} files` : ''} from ${ext.toUpperCase()} (mode: ${params.mode})\n\n✅ Scene restored from embedded data`
+          }]
+        };
+      }
+
       default:
         throw new Error(`Unknown tool: ${name}`);
     }
@@ -2232,11 +2767,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools };
 });
 
-// Start server
+return server;
+}
+
+// Start server (stdio mode)
 async function runServer(): Promise<void> {
   try {
     logger.info('Starting Excalidraw MCP server...');
 
+    const server = createMcpServer();
     const transport = new StdioServerTransport();
     logger.debug('Connecting to stdio transport...');
 
