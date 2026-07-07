@@ -186,7 +186,10 @@ export type WebSocketMessageType =
   | 'export_image_request'
   | 'set_viewport'
   | 'files_added'
-  | 'file_deleted';
+  | 'file_deleted'
+  | 'library_add'
+  | 'library_get'
+  | 'library_use';
 
 export interface InitialElementsMessage extends WebSocketMessage {
   type: 'initial_elements';

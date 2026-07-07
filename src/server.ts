@@ -28,6 +28,8 @@ import {
 import { YjsElementsMap, YjsFilesMap, setupYjsWebSocket } from './yjs-sync.js';
 import { z } from 'zod';
 import WebSocket from 'ws';
+import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
+import { createMcpServer } from './index.js';
 
 // Load environment variables
 dotenv.config();
@@ -48,11 +50,10 @@ const files = new YjsFilesMap();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Serve static files from the build directory
+// Serve static files from the build directory (no-cache for HTML to pick up new JS bundles)
 const staticDir = path.join(__dirname, '../dist');
-app.use(express.static(staticDir));
-// Also serve frontend assets
-app.use(express.static(path.join(__dirname, '../dist/frontend')));
+app.use(express.static(staticDir, { etag: false, maxAge: 0 }));
+app.use(express.static(path.join(__dirname, '../dist/frontend'), { etag: false, maxAge: 0 }));
 // Serve Excalidraw fonts so the font subsetting worker can fetch them for export
 app.use('/assets/fonts', express.static(
   path.join(__dirname, '../node_modules/@excalidraw/excalidraw/dist/prod/fonts')
@@ -1184,6 +1185,189 @@ app.get('/api/snapshots/:name', (req: Request, res: Response) => {
   }
 });
 
+// Force all connected browsers to reload the page
+app.post('/api/reload', (req: Request, res: Response) => {
+  broadcast({ type: 'reload_page' } as any);
+  res.json({ success: true, message: `Reload sent to ${clients.size} clients` });
+});
+
+// Library: search public libraries
+app.get('/api/library/search', async (req: Request, res: Response) => {
+  try {
+    const query = (req.query.q as string || '').toLowerCase();
+    const limit = Math.min(parseInt(req.query.limit as string || '20', 10), 50);
+
+    const response = await fetch('https://libraries.excalidraw.com/libraries.json');
+    if (!response.ok) {
+      throw new Error(`Failed to fetch library index: ${response.status}`);
+    }
+    const allLibraries = await response.json() as Array<{
+      id: string; name: string; description: string; authors: Array<{name: string}>;
+      source: string; preview: string; created: string; updated: string; version: number;
+    }>;
+
+    let results = allLibraries;
+    if (query) {
+      results = allLibraries.filter(lib =>
+        lib.name.toLowerCase().includes(query) ||
+        (lib.description || '').toLowerCase().includes(query)
+      );
+    }
+
+    res.json({
+      success: true,
+      query,
+      total: results.length,
+      libraries: results.slice(0, limit).map(lib => ({
+        id: lib.id,
+        name: lib.name,
+        description: lib.description,
+        authors: lib.authors,
+        source: lib.source,
+        version: lib.version
+      }))
+    });
+  } catch (error) {
+    logger.error('Error searching libraries:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Server-side library store — no browser round-trip needed
+interface LibraryItemStore {
+  id: string;
+  name: string;
+  status: string;
+  elements: any[];
+  created: number;
+}
+const libraryStore: LibraryItemStore[] = [];
+
+app.post('/api/library/add', async (req: Request, res: Response) => {
+  try {
+    const { source } = req.body;
+    if (!source || typeof source !== 'string') {
+      return res.status(400).json({ success: false, error: 'source is required (library source path)' });
+    }
+
+    const url = source.startsWith('http')
+      ? source
+      : `https://libraries.excalidraw.com/libraries/${source}`;
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`Failed to fetch library: ${response.status} from ${url}`);
+    }
+    const libraryData = await response.json() as Record<string, any>;
+
+    const rawItems = libraryData.libraryItems || libraryData.library || [];
+    const items: LibraryItemStore[] = rawItems.map((item: any, i: number) => ({
+      id: item.id || generateId(),
+      name: item.name || `item-${i}`,
+      status: item.status || 'published',
+      elements: item.elements || [],
+      created: item.created || Date.now()
+    }));
+
+    libraryStore.push(...items);
+    const itemNames = items.map(item => item.name);
+
+    // Also notify browser if connected
+    if (clients.size > 0) {
+      broadcast({ type: 'library_add', requestId: generateId(), libraryData });
+    }
+
+    res.json({ success: true, itemCount: items.length, itemNames });
+  } catch (error) {
+    logger.error('Error adding library:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+// Legacy callback endpoints (kept for frontend compatibility)
+app.post('/api/library/add/result', (_req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
+app.get('/api/library/items', (_req: Request, res: Response) => {
+  try {
+    const items = libraryStore.map((item, index) => ({
+      index,
+      id: item.id,
+      name: item.name,
+      status: item.status,
+      elementCount: item.elements.length
+    }));
+
+    res.json({ success: true, items });
+  } catch (error) {
+    logger.error('Error getting library:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
+app.post('/api/library/items/result', (_req: Request, res: Response) => {
+  res.json({ success: true });
+});
+
+app.post('/api/library/use', async (req: Request, res: Response) => {
+  try {
+    const { itemIndex, itemName, x, y } = req.body;
+
+    if (itemIndex === undefined && !itemName) {
+      return res.status(400).json({
+        success: false,
+        error: 'itemIndex or itemName is required'
+      });
+    }
+
+    let targetItem: LibraryItemStore | undefined;
+    if (itemIndex !== undefined && itemIndex < libraryStore.length) {
+      targetItem = libraryStore[itemIndex];
+    } else if (itemName) {
+      const searchName = itemName.toLowerCase();
+      targetItem = libraryStore.find(item =>
+        item.name.toLowerCase().includes(searchName)
+      );
+    }
+
+    if (!targetItem) {
+      return res.status(404).json({
+        success: false,
+        error: `Library item not found: ${itemName || `index ${itemIndex}`}. ${libraryStore.length} items loaded.`
+      });
+    }
+
+    const offsetX = x ?? 0;
+    const offsetY = y ?? 0;
+    const placedElements = targetItem.elements.map((el: any) => ({
+      ...el,
+      id: generateId(),
+      x: (el.x || 0) + offsetX,
+      y: (el.y || 0) + offsetY
+    }));
+
+    // Add elements via YjsElementsMap (auto-syncs to Yjs)
+    for (const el of placedElements) {
+      elements.set(el.id, { ...el, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), version: 1 });
+    }
+
+    broadcast({ type: 'elements_batch_created', elements: placedElements });
+
+    res.json({
+      success: true,
+      items: [{
+        name: targetItem.name,
+        elementCount: placedElements.length,
+        placedAt: { x: offsetX, y: offsetY }
+      }]
+    });
+  } catch (error) {
+    logger.error('Error using library item:', error);
+    res.status(500).json({ success: false, error: (error as Error).message });
+  }
+});
+
 // Serve the frontend
 app.get('/', (req: Request, res: Response) => {
   const htmlFile = path.join(__dirname, '../dist/frontend/index.html');
@@ -1228,6 +1412,47 @@ app.use((err: Error, req: Request, res: Response, next: NextFunction) => {
   });
 });
 
+// Streamable HTTP MCP endpoint
+app.post('/mcp', async (req: Request, res: Response) => {
+  try {
+    const mcpServer = createMcpServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // stateless
+    });
+    await mcpServer.connect(transport);
+    await transport.handleRequest(req, res, req.body);
+    res.on('close', () => {
+      transport.close();
+      mcpServer.close();
+    });
+  } catch (error) {
+    logger.error('Error handling MCP request:', error);
+    if (!res.headersSent) {
+      res.status(500).json({
+        jsonrpc: '2.0',
+        error: { code: -32603, message: 'Internal server error' },
+        id: null,
+      });
+    }
+  }
+});
+
+app.get('/mcp', (req: Request, res: Response) => {
+  res.writeHead(405).end(JSON.stringify({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed." },
+    id: null
+  }));
+});
+
+app.delete('/mcp', (req: Request, res: Response) => {
+  res.writeHead(405).end(JSON.stringify({
+    jsonrpc: "2.0",
+    error: { code: -32000, message: "Method not allowed." },
+    id: null
+  }));
+});
+
 // Start server
 const PORT = parseInt(process.env.PORT || '3000', 10);
 const HOST = process.env.HOST || 'localhost';
@@ -1254,6 +1479,7 @@ server.listen(PORT, HOST, () => {
   logger.info(`POC server running on http://${HOST}:${PORT}`);
   logger.info(`WebSocket server running on ws://${HOST}:${PORT}`);
   logger.info(`Yjs WebSocket server running on ws://${HOST}:${PORT}/yjs`);
+  logger.info(`MCP Streamable HTTP endpoint at http://${HOST}:${PORT}/mcp`);
 });
 
 export default app;
