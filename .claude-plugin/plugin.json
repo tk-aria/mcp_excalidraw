@@ -1,0 +1,6 @@
+{
+  "name": "excalidraw",
+  "description": "Programmatic canvas toolkit for Excalidraw — create, edit, and export diagrams with real-time canvas sync via MCP tools.",
+  "version": "1.0.2",
+  "keywords": ["excalidraw", "diagrams", "canvas", "drawing", "mcp", "visualization"]
+}
