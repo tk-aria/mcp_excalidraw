@@ -98,6 +98,26 @@ interface ApiResponse {
 type SyncStatus = 'idle' | 'syncing' | 'success' | 'error';
 const AUTO_SYNC_DEBOUNCE_MS = 1200;
 
+// Sort elements by Excalidraw fractional index (`index` field) — the source of
+// truth for z-order. The Yjs store is an unordered Map, so any array rebuilt
+// from it MUST be sorted with this before being handed to Excalidraw, or layer
+// order becomes nondeterministic. Plain string comparison is correct for
+// fractional indices ("a0" < "a1" < "a1V"). Elements without an index keep
+// their relative order and go on top (end of array); Excalidraw's updateScene
+// then assigns them valid indices matching that array position.
+const sortByFractionalIndex = <T extends { index?: string | null }>(els: T[]): T[] => {
+  return els
+    .map((el, i) => [el, i] as const)
+    .sort(([a, ai], [b, bi]) => {
+      const A = typeof a.index === 'string' ? a.index : null
+      const B = typeof b.index === 'string' ? b.index : null
+      if (A !== null && B !== null) return A < B ? -1 : A > B ? 1 : ai - bi
+      if (A === null && B === null) return ai - bi
+      return A === null ? 1 : -1
+    })
+    .map(([el]) => el)
+}
+
 // Helper function to clean elements for Excalidraw
 const cleanElementForExcalidraw = (element: ServerElement): Partial<ExcalidrawElement> => {
   const {
@@ -273,13 +293,46 @@ const convertElementsPreservingImageProps = (
   if (elements.length === 0) return []
 
   const validatedElements = validateAndFixBindings(elements)
-  const imageElements = validatedElements.filter(isImageElement).map(normalizeImageElement)
   const nonImageElements = validatedElements.filter(el => !isImageElement(el))
   // convertToExcalidrawElements may expand labeled shapes into [shape, textElement],
-  // so we cannot assume a 1:1 mapping — return all converted elements directly.
+  // so we cannot assume a 1:1 mapping.
   const convertedNonImageElements = convertToExcalidrawElements(nonImageElements as any, { regenerateIds: false })
   const restoredNonImageElements = restoreBindings(convertedNonImageElements, nonImageElements)
-  return recenterBoundShapeTextElements([...restoredNonImageElements, ...imageElements])
+
+  // Reassemble in the ORIGINAL input order — array order is Excalidraw's z-order.
+  // (Concatenating images after non-images here used to push every image to the
+  // front layer on each sync event.) Expansion products (e.g. bound label text)
+  // are emitted right after their container; images keep their input position.
+  const inputIds = new Set(validatedElements.map(el => el.id))
+  const convertedById = new Map(restoredNonImageElements.map(el => [el.id, el]))
+  const expansionByContainer = new Map<string, Partial<ExcalidrawElement>[]>()
+  const orphanExpansions: Partial<ExcalidrawElement>[] = []
+  for (const el of restoredNonImageElements) {
+    if (el.id && inputIds.has(el.id)) continue
+    const containerId = (el as any).containerId
+    if (containerId) {
+      const list = expansionByContainer.get(containerId) ?? []
+      list.push(el)
+      expansionByContainer.set(containerId, list)
+    } else {
+      orphanExpansions.push(el)
+    }
+  }
+
+  const ordered: Partial<ExcalidrawElement>[] = []
+  for (const orig of validatedElements) {
+    if (isImageElement(orig)) {
+      ordered.push(normalizeImageElement(orig))
+      continue
+    }
+    const converted = orig.id ? convertedById.get(orig.id) : undefined
+    if (converted) ordered.push(converted)
+    const expansions = orig.id ? expansionByContainer.get(orig.id) : undefined
+    if (expansions) ordered.push(...expansions)
+  }
+  ordered.push(...orphanExpansions)
+
+  return recenterBoundShapeTextElements(ordered)
 }
 
 function App(): JSX.Element {
@@ -312,7 +365,7 @@ function App(): JSX.Element {
         yElements.forEach((val: any, key: string) => {
           currentMap.set(key, cleanElementForExcalidraw(val))
         })
-        const merged = Array.from(currentMap.values())
+        const merged = sortByFractionalIndex(Array.from(currentMap.values()))
         const converted = convertElementsPreservingImageProps(merged as any)
         applySceneUpdateWithoutAutoSync(excalidrawAPI, {
           elements: converted,
@@ -459,7 +512,7 @@ function App(): JSX.Element {
         }
       })
 
-      const merged = Array.from(currentMap.values())
+      const merged = sortByFractionalIndex(Array.from(currentMap.values()))
       const converted = convertElementsPreservingImageProps(merged as any)
       applySceneUpdateWithoutAutoSync(api, {
         elements: converted,
@@ -607,7 +660,7 @@ function App(): JSX.Element {
       const result: ApiResponse = await response.json()
 
       if (result.success && result.elements && result.elements.length > 0) {
-        const cleanedElements = result.elements.map(cleanElementForExcalidraw)
+        const cleanedElements = sortByFractionalIndex(result.elements.map(cleanElementForExcalidraw))
         const convertedElements = convertElementsPreservingImageProps(cleanedElements)
         if (excalidrawAPI) {
           applySceneUpdateWithoutAutoSync(excalidrawAPI, {
@@ -709,7 +762,7 @@ function App(): JSX.Element {
 
         mergedElements.push(...incomingById.values())
 
-        const convertedElements = convertElementsPreservingImageProps(mergedElements)
+        const convertedElements = convertElementsPreservingImageProps(sortByFractionalIndex(mergedElements))
         applySceneUpdateWithoutAutoSync(excalidrawAPI, {
           elements: convertedElements,
           captureUpdate: CaptureUpdateAction.NEVER

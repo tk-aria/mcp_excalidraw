@@ -1,6 +1,8 @@
 export interface ExcalidrawElementBase {
   id: string;
   type: ExcalidrawElementType;
+  /** Excalidraw fractional index — the single source of truth for z-order (layer order) */
+  index?: string | null;
   x: number;
   y: number;
   width?: number;

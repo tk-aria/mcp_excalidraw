@@ -26,6 +26,7 @@ import {
   normalizeFontFamily
 } from './types.js';
 import { YjsElementsMap, YjsFilesMap, setupYjsWebSocket } from './yjs-sync.js';
+import { generateNKeysBetween } from 'fractional-indexing';
 import { z } from 'zod';
 import WebSocket from 'ws';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
@@ -45,6 +46,44 @@ const wss = new WebSocketServer({ noServer: true });
 const elements = new YjsElementsMap();
 // Yjs-backed file storage (images sync via CRDT alongside elements)
 const files = new YjsFilesMap();
+
+// ── Z-order (layer order) ────────────────────────────────────────
+// The Yjs store is an unordered Map, so z-order lives on each element as an
+// Excalidraw fractional index (`index`, e.g. "a0" < "a1" < "a1V"). Plain string
+// comparison yields the correct order. Every array handed to clients/exports
+// must be sorted with this comparator, and every element created server-side
+// must be assigned an index, or its layer position would be nondeterministic.
+function compareByFractionalIndex(a: ServerElement, b: ServerElement): number {
+  const ai = typeof a.index === 'string' ? a.index : null;
+  const bi = typeof b.index === 'string' ? b.index : null;
+  if (ai !== null && bi !== null) return ai < bi ? -1 : ai > bi ? 1 : 0;
+  if (ai === null && bi === null) return 0;
+  return ai === null ? 1 : -1; // elements without an index go on top (end of array)
+}
+
+function sortedElements(): ServerElement[] {
+  return Array.from(elements.values()).sort(compareByFractionalIndex);
+}
+
+// Assign fractional indices (after the current topmost element) to any element
+// in `els` that doesn't have one yet, preserving the array's relative order.
+function assignFractionalIndices(els: ServerElement[]): void {
+  const missing = els.filter(el => typeof el.index !== 'string' || el.index === '');
+  if (missing.length === 0) return;
+  let maxIndex: string | null = null;
+  elements.forEach(el => {
+    if (typeof el.index === 'string' && (maxIndex === null || el.index > maxIndex)) {
+      maxIndex = el.index;
+    }
+  });
+  for (const el of els) {
+    if (!missing.includes(el) && typeof el.index === 'string' && (maxIndex === null || el.index > maxIndex)) {
+      maxIndex = el.index;
+    }
+  }
+  const keys = generateNKeysBetween(maxIndex, null, missing.length);
+  missing.forEach((el, i) => { el.index = keys[i]; });
+}
 
 // Middleware
 app.use(cors());
@@ -93,7 +132,7 @@ wss.on('connection', (ws: WebSocket) => {
   files.forEach((f, id) => { filesObj[id] = f; });
   const initialMessage: InitialElementsMessage & { files?: Record<string, ExcalidrawFile> } = {
     type: 'initial_elements',
-    elements: Array.from(elements.values()),
+    elements: sortedElements(),
     ...(files.size > 0 ? { files: filesObj } : {})
   };
   ws.send(JSON.stringify(initialMessage));
@@ -120,6 +159,7 @@ wss.on('connection', (ws: WebSocket) => {
 // Schema validation
 const CreateElementSchema = z.object({
   id: z.string().optional(), // Allow passing ID for MCP sync
+  index: z.string().optional(), // Fractional index (z-order); assigned server-side when missing
   type: z.enum(Object.values(EXCALIDRAW_ELEMENT_TYPES) as [ExcalidrawElementType, ...ExcalidrawElementType[]]),
   x: z.number(),
   y: z.number(),
@@ -236,7 +276,7 @@ const UpdateElementSchema = z.object({
 // Get all elements
 app.get('/api/elements', (req: Request, res: Response) => {
   try {
-    const elementsArray = Array.from(elements.values());
+    const elementsArray = sortedElements();
     res.json({
       success: true,
       elements: elementsArray,
@@ -272,6 +312,9 @@ app.post('/api/elements', (req: Request, res: Response) => {
     if (element.type === 'arrow' || element.type === 'line') {
       resolveArrowBindings([element]);
     }
+
+    // Assign z-order (fractional index) so the element has a stable layer position
+    assignFractionalIndices([element]);
 
     elements.set(id, element);
 
@@ -442,7 +485,7 @@ app.delete('/api/elements/:id', (req: Request, res: Response) => {
 app.get('/api/elements/search', (req: Request, res: Response) => {
   try {
     const { type, ...filters } = req.query;
-    let results = Array.from(elements.values());
+    let results = sortedElements();
 
     // Filter by type if specified
     if (type && typeof type === 'string') {
@@ -655,6 +698,9 @@ app.post('/api/elements/batch', (req: Request, res: Response) => {
     // Resolve arrow bindings (computes positions, startBinding, endBinding, boundElements)
     resolveArrowBindings(createdElements);
 
+    // Assign z-order (fractional indices) preserving the batch's array order
+    assignFractionalIndices(createdElements);
+
     // Store all elements after binding resolution
     createdElements.forEach(el => elements.set(el.id, el));
 
@@ -744,6 +790,10 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
     // Build a set of incoming element IDs for tracking
     const incomingIds = new Set<string>();
 
+    // Assign z-order to any incoming element that lacks a fractional index
+    // (frontend elements always carry one; raw imports may not)
+    assignFractionalIndices(frontendElements.filter((e: any) => e && !e.isDeleted));
+
     // Merge incoming elements (add new, update existing by version/timestamp)
     let mergedCount = 0;
     frontendElements.forEach((element: any, index: number) => {
@@ -801,7 +851,7 @@ app.post('/api/elements/sync', (req: Request, res: Response) => {
     logger.info(`Sync merged: ${mergedCount} from client, ${elements.size} total (was ${beforeCount})`);
 
     // Collect all active elements after merge for broadcast
-    const allElements = Array.from(elements.values());
+    const allElements = sortedElements();
 
     // Broadcast merged state to all WebSocket clients
     broadcast({
@@ -915,7 +965,7 @@ app.post('/api/export/image', (req: Request, res: Response) => {
     files.forEach((f, id) => { filesObj[id] = f; });
     broadcast({
       type: 'initial_elements',
-      elements: Array.from(elements.values()),
+      elements: sortedElements(),
       ...(files.size > 0 ? { files: filesObj } : {})
     } as InitialElementsMessage & { files?: Record<string, ExcalidrawFile> });
 
@@ -1114,7 +1164,7 @@ app.post('/api/snapshots', (req: Request, res: Response) => {
 
     const snapshot: Snapshot = {
       name,
-      elements: Array.from(elements.values()),
+      elements: sortedElements(),
       createdAt: new Date().toISOString()
     };
 
